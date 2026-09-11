@@ -691,7 +691,9 @@ class TestGarminClient:
         sleep_payload = {
             "dailySleepDTO": {
                 "sleepStartTimestampGMT": int(gmt_start.timestamp() * 1000),
-                "sleepStartTimestampLocal": int((gmt_start + offset).timestamp() * 1000),
+                "sleepStartTimestampLocal": int(
+                    (gmt_start + offset).timestamp() * 1000
+                ),
                 "sleepEndTimestampGMT": int(gmt_end.timestamp() * 1000),
                 "sleepEndTimestampLocal": int((gmt_end + offset).timestamp() * 1000),
                 "sleepScores": {"overall": {"value": 84}},
