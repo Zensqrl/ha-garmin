@@ -424,7 +424,27 @@ def _to_offset_minutes(value: int | float | None) -> int | None:
 def _extract_sleep_timezone_offset_minutes(
     daily_sleep: dict[str, Any], summary_raw: dict[str, Any]
 ) -> int:
-    """Extract sleep timezone offset in minutes, defaulting to UTC."""
+    """Extract sleep timezone offset in minutes, defaulting to UTC.
+
+    Most reliable first: Garmin pairs every sleep timestamp with both a GMT
+    and a Local variant (LocalMs = GMTMs + offsetMs), so their delta *is*
+    the exact offset for that sleep session -- no guessing, and correct
+    across DST transitions. The explicit timezoneOffset keys and the
+    body-battery-event fallback below aren't reliably present in every
+    account's payload (home-assistant-garmin_connect#564); when they're
+    absent this used to silently default to 0, storing the local wall-clock
+    time mislabeled as UTC and letting Home Assistant's own UTC-to-local
+    display conversion double-shift it.
+    """
+    for local_key, gmt_key in [
+        ("sleepStartTimestampLocal", "sleepStartTimestampGMT"),
+        ("sleepEndTimestampLocal", "sleepEndTimestampGMT"),
+    ]:
+        local_ms = daily_sleep.get(local_key)
+        gmt_ms = daily_sleep.get(gmt_key)
+        if isinstance(local_ms, (int, float)) and isinstance(gmt_ms, (int, float)):
+            return round((local_ms - gmt_ms) / 60000)
+
     for key in [
         "timezoneOffset",
         "timeZoneOffset",
