@@ -24,6 +24,8 @@ HYDRATION_LOG_URL = (
     f"{GARMIN_CONNECT_API}/usersummary-service/usersummary/hydration/log"
 )
 DAILY_STEPS_URL = f"{GARMIN_CONNECT_API}/usersummary-service/stats/steps/daily"
+# One response carries both stressValuesArray and bodyBatteryValuesArray
+DAILY_STRESS_URL = f"{GARMIN_CONNECT_API}/wellness-service/wellness/dailyStress"
 
 # Body composition endpoints
 BODY_COMPOSITION_URL = f"{GARMIN_CONNECT_API}/weight-service/weight/range"

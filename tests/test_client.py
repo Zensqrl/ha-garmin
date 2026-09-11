@@ -650,9 +650,13 @@ class TestGarminClient:
             patch.object(
                 client, "_get_sleep_data_raw", new_callable=AsyncMock
             ) as mock_sleep,
+            patch.object(
+                client, "get_daily_stress", new_callable=AsyncMock
+            ) as mock_stress,
         ):
             mock_steps.return_value = None
             mock_sleep.return_value = None
+            mock_stress.return_value = {}
             data = await client.fetch_core_data(date(2026, 4, 12))
 
         # Today's failed fetch must not be silently replaced by yesterday's
@@ -694,9 +698,13 @@ class TestGarminClient:
             patch.object(
                 client, "_get_sleep_data_raw", new_callable=AsyncMock
             ) as mock_sleep,
+            patch.object(
+                client, "get_daily_stress", new_callable=AsyncMock
+            ) as mock_stress,
         ):
             mock_steps.return_value = None
             mock_sleep.return_value = None
+            mock_stress.return_value = {}
             data = await client.fetch_core_data(date(2026, 4, 12))
 
         assert mock_summary.await_args_list == [
@@ -1416,3 +1424,361 @@ class TestSecurityAuditHardening:
 
         assert _sanitize_filename('a"\r\nb\\c.fit') == "a___b_c.fit"
         assert _sanitize_filename("normal.fit") == "normal.fit"
+
+
+class TestIntradayTimelines:
+    """Tests for the dailyStress intraday Body Battery / stress timelines."""
+
+    @staticmethod
+    def _payload(**overrides):
+        """Synthetic dailyStress response in Garmin's documented column order."""
+        payload = {
+            "calendarDate": "2026-01-15",
+            "stressValueDescriptorsDTOList": [
+                {
+                    "stressValueDescriptorIndex": 0,
+                    "stressValueDescriptorKey": "timestamp",
+                },
+                {
+                    "stressValueDescriptorIndex": 1,
+                    "stressValueDescriptorKey": "stressLevel",
+                },
+            ],
+            "bodyBatteryValueDescriptorDTOList": [
+                {
+                    "bodyBatteryValueDescriptorIndex": 0,
+                    "bodyBatteryValueDescriptorKey": "timestamp",
+                },
+                {
+                    "bodyBatteryValueDescriptorIndex": 1,
+                    "bodyBatteryValueDescriptorKey": "bodyBatteryStatus",
+                },
+                {
+                    "bodyBatteryValueDescriptorIndex": 2,
+                    "bodyBatteryValueDescriptorKey": "bodyBatteryLevel",
+                },
+                {
+                    "bodyBatteryValueDescriptorIndex": 3,
+                    "bodyBatteryValueDescriptorKey": "bodyBatteryVersion",
+                },
+            ],
+            "stressValuesArray": [
+                [1768446000000, 22],
+                [1768446180000, 35],
+            ],
+            "bodyBatteryValuesArray": [
+                [1768446000000, "MEASURED", 74, 1.0],
+                [1768446180000, "MEASURED", 71, 1.0],
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    async def test_get_daily_stress_requests_the_date(self):
+        """get_daily_stress must hit the dailyStress endpoint for the date."""
+        client = GarminClient(_make_auth())
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = self._payload()
+            result = await client.get_daily_stress(date(2026, 1, 15))
+
+        url = mock_request.call_args[0][1]
+        assert url.endswith("/wellness-service/wellness/dailyStress/2026-01-15")
+        assert result["calendarDate"] == "2026-01-15"
+
+    async def test_get_daily_stress_non_dict_response(self):
+        """A non-dict response must degrade to an empty dict."""
+        client = GarminClient(_make_auth())
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = []
+            assert await client.get_daily_stress(date(2026, 1, 15)) == {}
+
+    @pytest.mark.parametrize(
+        "target_date",
+        [
+            date(2019, 3, 7),
+            date(2024, 2, 29),
+            date(2026, 1, 15),
+            date(2026, 12, 31),
+        ],
+    )
+    async def test_get_daily_stress_accepts_any_date(self, target_date):
+        """The endpoint must work for any calendar day, not just today."""
+        client = GarminClient(_make_auth())
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = self._payload()
+            await client.get_daily_stress(target_date)
+
+        assert mock_request.call_args[0][1].endswith(f"/{target_date.isoformat()}")
+
+    async def test_get_daily_stress_defaults_to_today(self):
+        """Omitting target_date falls back to today rather than being required."""
+        client = GarminClient(_make_auth())
+        today = date.today()
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = self._payload()
+            await client.get_daily_stress()
+
+        assert mock_request.call_args[0][1].endswith(f"/{today.isoformat()}")
+
+    def test_transform_normalizes_both_series(self):
+        """Both arrays become [[epoch_ms, value], ...] plus the calendar date."""
+        from ha_garmin.client import _transform_daily_stress
+
+        result = _transform_daily_stress(self._payload())
+
+        assert result["stressTimeline"] == [
+            [1768446000000, 22],
+            [1768446180000, 35],
+        ]
+        assert result["bodyBatteryTimeline"] == [
+            [1768446000000, 74],
+            [1768446180000, 71],
+        ]
+        assert result["intradayCalendarDate"] == date(2026, 1, 15)
+
+    def test_transform_sorts_chronologically(self):
+        """Out-of-order rows must be sorted oldest first."""
+        from ha_garmin.client import _transform_daily_stress
+
+        result = _transform_daily_stress(
+            self._payload(
+                stressValuesArray=[
+                    [1768446360000, 40],
+                    [1768446000000, 22],
+                    [1768446180000, 35],
+                ]
+            )
+        )
+
+        timestamps = [point[0] for point in result["stressTimeline"]]
+        assert timestamps == sorted(timestamps)
+
+    def test_transform_drops_malformed_rows(self):
+        """Short, non-list and non-numeric rows are dropped, good rows kept."""
+        from ha_garmin.client import _transform_daily_stress
+
+        result = _transform_daily_stress(
+            self._payload(
+                stressValuesArray=[
+                    [1768446000000, 22],
+                    [1768446180000],
+                    "not-a-row",
+                    None,
+                    [None, 30],
+                    [1768446360000, None],
+                    [1768446540000, "40"],
+                    [1768446720000, 45],
+                ]
+            )
+        )
+
+        assert result["stressTimeline"] == [
+            [1768446000000, 22],
+            [1768446720000, 45],
+        ]
+
+    def test_transform_preserves_negative_stress_sentinels(self):
+        """-1 (unmeasurable) and -2 (no reading) are data, not malformed rows."""
+        from ha_garmin.client import _transform_daily_stress
+
+        result = _transform_daily_stress(
+            self._payload(
+                stressValuesArray=[
+                    [1768446000000, -1],
+                    [1768446180000, -2],
+                    [1768446360000, 30],
+                ]
+            )
+        )
+
+        assert [point[1] for point in result["stressTimeline"]] == [-1, -2, 30]
+
+    def test_transform_follows_reordered_descriptors(self):
+        """Column positions come from the descriptor list, not from assumption."""
+        from ha_garmin.client import _transform_daily_stress
+
+        result = _transform_daily_stress(
+            self._payload(
+                bodyBatteryValueDescriptorDTOList=[
+                    {
+                        "bodyBatteryValueDescriptorIndex": 2,
+                        "bodyBatteryValueDescriptorKey": "timestamp",
+                    },
+                    {
+                        "bodyBatteryValueDescriptorIndex": 0,
+                        "bodyBatteryValueDescriptorKey": "bodyBatteryLevel",
+                    },
+                ],
+                bodyBatteryValuesArray=[[74, "MEASURED", 1768446000000, 1.0]],
+            )
+        )
+
+        assert result["bodyBatteryTimeline"] == [[1768446000000, 74]]
+
+    def test_transform_tolerates_extra_columns(self):
+        """Trailing columns Garmin may add must not break normalization."""
+        from ha_garmin.client import _transform_daily_stress
+
+        result = _transform_daily_stress(
+            self._payload(
+                bodyBatteryValuesArray=[
+                    [1768446000000, "MEASURED", 74, 1.0, "SOMETHING_NEW"],
+                ]
+            )
+        )
+
+        assert result["bodyBatteryTimeline"] == [[1768446000000, 74]]
+
+    def test_transform_without_descriptor_lists(self):
+        """Missing descriptor lists fall back to the documented column order."""
+        from ha_garmin.client import _transform_daily_stress
+
+        payload = self._payload()
+        del payload["stressValueDescriptorsDTOList"]
+        del payload["bodyBatteryValueDescriptorDTOList"]
+
+        result = _transform_daily_stress(payload)
+
+        assert result["stressTimeline"] == [
+            [1768446000000, 22],
+            [1768446180000, 35],
+        ]
+        assert result["bodyBatteryTimeline"] == [
+            [1768446000000, 74],
+            [1768446180000, 71],
+        ]
+
+    def test_transform_missing_or_null_arrays(self):
+        """Absent or null arrays produce empty timelines, never None."""
+        from ha_garmin.client import _transform_daily_stress
+
+        assert _transform_daily_stress({}) == {
+            "stressTimeline": [],
+            "bodyBatteryTimeline": [],
+            "intradayCalendarDate": None,
+        }
+        assert (
+            _transform_daily_stress(
+                self._payload(stressValuesArray=None, bodyBatteryValuesArray=None)
+            )["stressTimeline"]
+            == []
+        )
+
+    def test_transform_timestamps_are_timezone_independent(self):
+        """Epoch ms are emitted verbatim; a UTC-13 day still maps to its date."""
+        from ha_garmin.client import _transform_daily_stress
+
+        # 2026-01-15 00:05 in Pacific/Auckland (UTC+13) == 2026-01-14 11:05 UTC
+        local_midnight_plus_5 = int(
+            datetime(2026, 1, 14, 11, 5, tzinfo=UTC).timestamp() * 1000
+        )
+        result = _transform_daily_stress(
+            self._payload(
+                calendarDate="2026-01-15",
+                stressValuesArray=[[local_midnight_plus_5, 18]],
+            )
+        )
+
+        assert result["stressTimeline"] == [[local_midnight_plus_5, 18]]
+        assert result["intradayCalendarDate"] == date(2026, 1, 15)
+
+    def test_transform_day_boundary_rows_are_kept(self):
+        """Samples either side of local midnight survive normalization."""
+        from ha_garmin.client import _transform_daily_stress
+
+        before = int(datetime(2026, 1, 14, 23, 57, tzinfo=UTC).timestamp() * 1000)
+        after = int(datetime(2026, 1, 15, 0, 3, tzinfo=UTC).timestamp() * 1000)
+        result = _transform_daily_stress(
+            self._payload(stressValuesArray=[[after, 20], [before, 15]])
+        )
+
+        assert result["stressTimeline"] == [[before, 15], [after, 20]]
+
+    async def test_fetch_core_data_exposes_timelines(self):
+        """fetch_core_data must surface both timelines as top-level keys."""
+        client = GarminClient(_make_auth())
+
+        with (
+            patch.object(
+                client, "_get_user_summary_raw", new_callable=AsyncMock
+            ) as mock_summary,
+            patch.object(client, "get_daily_steps", new_callable=AsyncMock) as mock_st,
+            patch.object(
+                client, "_get_sleep_data_raw", new_callable=AsyncMock
+            ) as mock_sleep,
+            patch.object(
+                client, "get_daily_stress", new_callable=AsyncMock
+            ) as mock_stress,
+        ):
+            mock_summary.return_value = {"dailyStepGoal": 10000}
+            mock_st.return_value = []
+            mock_sleep.return_value = {}
+            mock_stress.return_value = self._payload()
+
+            data = await client.fetch_core_data(date(2026, 1, 15))
+
+        assert data["bodyBatteryTimeline"] == [
+            [1768446000000, 74],
+            [1768446180000, 71],
+        ]
+        assert data["stressTimeline"][0] == [1768446000000, 22]
+        assert data["intradayCalendarDate"] == date(2026, 1, 15)
+
+    async def test_fetch_core_data_forwards_target_date(self):
+        """A backfill of an old day must request that day's timelines, not today's."""
+        client = GarminClient(_make_auth())
+        backfill_date = date(2025, 6, 3)
+
+        with (
+            patch.object(
+                client, "_get_user_summary_raw", new_callable=AsyncMock
+            ) as mock_summary,
+            patch.object(client, "get_daily_steps", new_callable=AsyncMock) as mock_st,
+            patch.object(
+                client, "_get_sleep_data_raw", new_callable=AsyncMock
+            ) as mock_sleep,
+            patch.object(
+                client, "get_daily_stress", new_callable=AsyncMock
+            ) as mock_stress,
+        ):
+            mock_summary.return_value = {"dailyStepGoal": 10000}
+            mock_st.return_value = []
+            mock_sleep.return_value = {}
+            mock_stress.return_value = self._payload(calendarDate="2025-06-03")
+
+            data = await client.fetch_core_data(backfill_date)
+
+        mock_stress.assert_awaited_once_with(backfill_date)
+        assert data["intradayCalendarDate"] == backfill_date
+
+    async def test_fetch_core_data_survives_dailystress_failure(self):
+        """A dailyStress failure must empty the timelines, not the whole poll."""
+        client = GarminClient(_make_auth())
+
+        with (
+            patch.object(
+                client, "_get_user_summary_raw", new_callable=AsyncMock
+            ) as mock_summary,
+            patch.object(client, "get_daily_steps", new_callable=AsyncMock) as mock_st,
+            patch.object(
+                client, "_get_sleep_data_raw", new_callable=AsyncMock
+            ) as mock_sleep,
+            patch.object(
+                client, "get_daily_stress", new_callable=AsyncMock
+            ) as mock_stress,
+        ):
+            mock_summary.return_value = {"dailyStepGoal": 10000}
+            mock_st.return_value = []
+            mock_sleep.return_value = {}
+            mock_stress.side_effect = GarminAPIError("boom", 500)
+
+            data = await client.fetch_core_data(date(2026, 1, 15))
+
+        assert data["dailyStepGoal"] == 10000
+        assert data["bodyBatteryTimeline"] == []
+        assert data["stressTimeline"] == []
+        assert data["intradayCalendarDate"] is None
