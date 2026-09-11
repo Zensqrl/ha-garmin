@@ -60,6 +60,9 @@ Pick the aggregate the integration already polls for that domain (core, activity
 - Use `await self._safe_call(self.get_race_predictions, target_date)` — it logs and returns `None` on `GarminAPIError`, so one premium-only endpoint failing never blanks the whole poll.
 - Flatten the result into **top-level, sensor-ready keys** on the returned dict. Do not nest, and do not add a new aggregate method unless the user asks.
 - Apply the existing normalization contract, which downstream sensors depend on: rename `startTimeGMT` → `startTime` (UTC) and drop `startTimeLocal`; flatten `activityType` to a plain string; convert `*InSecs` fields to minutes; add any new activity field to `ACTIVITY_ESSENTIAL_KEYS` or the trimming step will strip it.
+- Garmin mixes GMT strings, local strings, timezone offsets and epoch milliseconds in one payload. Determine which a field is from its name and its `*GMT`/`*Local`/offset neighbours — never from the value. Emit a UTC `datetime` or epoch **milliseconds**, say which in the docstring, and do not "correct" a timestamp so a chart looks right.
+- Resolve array columns from the response's descriptor lists when Garmin provides them. Never index a values array by an assumed position.
+- Do not reinterpret unknown or sentinel values (negatives, magic numbers) into friendly states. Preserve the raw value and report what you saw.
 - Keep the docstring's `API calls:` line accurate — it records the per-poll request budget.
 
 ## 5. Tests
@@ -81,6 +84,8 @@ async def test_get_race_predictions(self):
 ```
 
 Cover the non-dict/empty response path too. `unittest.mock` only — no `responses`/`respx`/`aioresponses`. `asyncio_mode = "auto"`, so no `@pytest.mark.asyncio`.
+
+When the endpoint returns arrays or timestamps, also cover: missing/null arrays, malformed rows, extra columns, chronological ordering, a non-UTC timezone, and the day boundary. Test payloads must be synthetic or sanitized — never commit real Garmin responses, tokens, profile IDs, or personal health data.
 
 ## 6. Verify and release
 

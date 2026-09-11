@@ -58,6 +58,8 @@ The integration depends on these transformations; changing them is a breaking ch
 - `*InSecs` fields are converted to minutes (e.g. `estimatedDurationMinutes`).
 - `polyline` is exposed under `lastActivityRoute`, not `lastActivity`.
 
+Garmin mixes GMT strings, local strings, timezone offsets and epoch milliseconds in the same payload. Never infer which one a field is from its value — check the field name and the neighbouring `*GMT`/`*Local`/offset fields. Emit either a UTC `datetime` or epoch **milliseconds**, document which, and cover the day boundary and a non-UTC timezone in tests.
+
 ### Safety helpers
 
 Path parameters must go through `_assert_safe_url()`, `_validate_positive_int()`, or `_validate_uuid()` before being interpolated into a URL. Session files are written with symlink rejection — keep those checks when touching `save_session()`/`load_session()`.
@@ -74,4 +76,5 @@ Path parameters must go through `_assert_safe_url()`, `_validate_positive_int()`
 - `unittest.mock` only — no `responses`/`respx`/`aioresponses`. Client tests patch `_request` with `AsyncMock`; auth tests patch the strategy methods or `cffi_requests.get/post`.
 - `asyncio_mode = "auto"` — do not add `@pytest.mark.asyncio`.
 - [tests/conftest.py](tests/conftest.py) is intentionally empty; fixtures live in the test modules.
+- Test payloads must be synthetic or sanitized. Never commit real Garmin responses, tokens, profile IDs, or personal health data.
 - **`test_fetch_data.py` and `test_add_data.py` in the repo root are not pytest files** — they are manual scripts run against real credentials (`GARMIN_EMAIL`/`GARMIN_PASSWORD` or `.garmin_tokens.json`). Never collect them in CI or convert them to tests.
