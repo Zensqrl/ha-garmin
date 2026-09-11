@@ -2699,11 +2699,11 @@ class GarminClient:
         }
 
     async def fetch_gear_data(self, timezone: str | None = None) -> dict[str, Any]:
-        """Fetch gear data: gear, defaults, stats, alarms, solar, devices.
+        """Fetch gear data: gear, defaults, stats, alarms, solar, devices, sensors.
 
         API calls: get_gear, get_gear_defaults, get_gear_stats×N,
                    get_devices, get_device_alarms, get_device_solar_data×N,
-                   get_device_last_used
+                   get_device_last_used, get_sensors
         """
         # Get user profile ID for gear API
         profile = await self._safe_call(self.get_user_profile)
@@ -2810,6 +2810,12 @@ class GarminClient:
                 }
             )
 
+        # Paired ANT+/BLE sensors (power meters, HR straps, etc.) and their
+        # battery status. Passed through untrimmed -- the field shape isn't
+        # well documented, so a whitelist here risks silently dropping
+        # fields a consumer actually wants.
+        sensors = await self._safe_call(self.get_sensors) or []
+
         return {
             "gear": gear,
             "gearStats": gear_stats,
@@ -2818,6 +2824,7 @@ class GarminClient:
             "solarIntensity": solar_intensity,
             "devices": trimmed_devices,
             "lastUsedDevice": last_used_device,
+            "sensors": sensors,
         }
 
     async def fetch_blood_pressure_data(
