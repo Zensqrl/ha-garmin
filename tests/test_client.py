@@ -1484,6 +1484,42 @@ class TestSecurityAuditHardening:
         with pytest.raises(ValueError, match="user_profile_id"):
             await client.get_gear_defaults("1/../../admin")
 
+    async def test_fetch_gear_data_includes_sensors(self):
+        """fetch_gear_data must surface paired ANT+/BLE sensors (home-assistant-garmin_connect#535)."""
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        profile = MagicMock()
+        profile.profile_id = 999
+
+        sensor_payload = [
+            {
+                "deviceId": 111,
+                "sensorType": "HEART_RATE",
+                "batteryStatus": "good",
+                "batteryLevel": 82,
+            },
+            {
+                "deviceId": 222,
+                "sensorType": "BIKE_POWER",
+                "batteryStatus": "low",
+                "batteryLevel": 15,
+            },
+        ]
+
+        with (
+            patch.object(client, "get_user_profile", return_value=profile),
+            patch.object(client, "get_gear", return_value=[]),
+            patch.object(client, "get_gear_defaults", return_value=[]),
+            patch.object(client, "get_devices", return_value=[]),
+            patch.object(client, "get_device_last_used", return_value={}),
+            patch.object(client, "get_device_alarms", return_value=[]),
+            patch.object(client, "get_sensors", return_value=sensor_payload),
+        ):
+            data = await client.fetch_gear_data()
+
+        assert data["sensors"] == sensor_payload
+
     async def test_set_active_gear_rejects_unknown_activity_type(self):
         auth = _make_auth()
         client = GarminClient(auth)
