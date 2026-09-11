@@ -135,6 +135,32 @@ async def main():
                 elif k not in ("polyline", "hrTimeInZones"):
                     print(f"    {k}: {v}")
 
+    # === FETCH SCHEDULED WORKOUTS DATA (training calendar / Garmin Coach) ===
+    # activity_data["scheduledWorkouts"] already has the current month via
+    # fetch_activity_data; fetched again explicitly here (plus next month,
+    # for a plan whose next session lands after a month boundary) since the
+    # response shape isn't verified yet -- this is the easiest place to
+    # inspect it (home-assistant-garmin_connect#521).
+    print("\n" + "=" * 60)
+    print("  FETCHING SCHEDULED WORKOUTS (training calendar)")
+    print("=" * 60)
+    scheduled_workouts_data = await client.get_scheduled_workouts(
+        today.year, today.month
+    )
+    print_section(
+        f"Scheduled Workouts ({today.year}-{today.month:02d})", scheduled_workouts_data
+    )
+
+    next_month = today.month + 1 if today.month < 12 else 1
+    next_month_year = today.year if today.month < 12 else today.year + 1
+    next_month_scheduled_workouts_data = await client.get_scheduled_workouts(
+        next_month_year, next_month
+    )
+    print_section(
+        f"Scheduled Workouts ({next_month_year}-{next_month:02d})",
+        next_month_scheduled_workouts_data,
+    )
+
     # === FETCH TRAINING DATA ===
     print("\n" + "=" * 60)
     print("  FETCHING TRAINING DATA")
@@ -207,6 +233,8 @@ async def main():
         "menstrual": menstrual_data,
         "nutrition": nutrition_data,
         "sensors": sensors_data,
+        "scheduled_workouts_this_month": scheduled_workouts_data,
+        "scheduled_workouts_next_month": next_month_scheduled_workouts_data,
     }
 
     for section, data in all_data.items():
