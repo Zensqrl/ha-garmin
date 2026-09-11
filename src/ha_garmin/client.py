@@ -2801,10 +2801,23 @@ class GarminClient:
             if not dtos:
                 continue
             readings = dtos[0].get("solarInputReadings") or []
+            # A single "latest" reading only reflects solar conditions at the
+            # moment of the last sync, which can be way off from the day as a
+            # whole -- e.g. syncing at night reads ~0% even on a sunny day
+            # (home-assistant-garmin_connect#508). Aggregate the full day's
+            # readings too, which cost nothing extra: they're already in the
+            # same response.
             latest = None
+            utilization_values: list[float] = []
+            total_gain_ms = 0
             for reading in readings:
-                if reading.get("solarUtilization") is not None:
+                utilization = reading.get("solarUtilization")
+                if utilization is not None:
                     latest = reading
+                    utilization_values.append(utilization)
+                gain_ms = reading.get("activityTimeGainMs")
+                if gain_ms is not None:
+                    total_gain_ms += gain_ms
             solar_intensity.append(
                 {
                     "deviceId": device_id,
@@ -2819,6 +2832,14 @@ class GarminClient:
                     "readingTimestampGmt": latest.get("readingTimestampGmt")
                     if latest
                     else None,
+                    "avgSolarUtilization": (
+                        round(sum(utilization_values) / len(utilization_values), 1)
+                        if utilization_values
+                        else None
+                    ),
+                    "totalActivityTimeGainMinutes": (
+                        round(total_gain_ms / 60000) if readings else None
+                    ),
                 }
             )
 
