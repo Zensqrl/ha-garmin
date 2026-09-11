@@ -1,0 +1,120 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: cyberjunky/ha-garmin
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+  SYNC_BRANCH: sync/upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Assess
+        id: assess
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Already contains upstream/${UPSTREAM_BRANCH}."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$(gh pr list --state open --base "${FORK_BRANCH}" --head "${SYNC_BRANCH}" --json number --jq '.[0].number')" ]; then
+            echo "A sync PR is already open."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A previously merged sync PR whose head is no longer an ancestor means
+          # that merge was squashed or rebased, which breaks the ancestry check.
+          prev=$(gh pr list --state merged --base "${FORK_BRANCH}" --head "${SYNC_BRANCH}" --limit 1 --json headRefOid --jq '.[0].headRefOid // empty')
+          if [ -n "$prev" ] && git cat-file -e "$prev" 2>/dev/null && ! git merge-base --is-ancestor "$prev" HEAD; then
+            echo "broken_history=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}" >/dev/null 2>&1 || true
+          conflicts=$(git diff --name-only --diff-filter=U)
+          git merge --abort 2>/dev/null || git reset --hard
+
+          {
+            echo "conflicts<<EOF"
+            echo "$conflicts"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Open sync PR
+        if: steps.assess.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICTS: ${{ steps.assess.outputs.conflicts }}
+          BROKEN: ${{ steps.assess.outputs.broken_history }}
+        run: |
+          git push --force origin "refs/remotes/upstream/${UPSTREAM_BRANCH}:refs/heads/${SYNC_BRANCH}"
+
+          title="Sync with ${UPSTREAM_REPO}"
+          [ -n "$CONFLICTS" ] && title="[CONFLICTS] ${title}"
+
+          {
+            echo "## Merge this with a merge commit"
+            echo
+            echo "Do **not** squash or rebase. The sync automation asks"
+            echo '`git merge-base --is-ancestor upstream/'"${UPSTREAM_BRANCH}"' '"${FORK_BRANCH}"'`.'
+            echo "A squash keeps upstream's content but not its commits, so that check"
+            echo "stays false forever and this PR reopens every run."
+            echo
+            if [ -n "$BROKEN" ]; then
+              echo "> **A previous sync PR was squashed or rebased.** The ancestry chain is"
+              echo "> broken; repair history before merging this one."
+              echo
+            fi
+            if [ -n "$CONFLICTS" ]; then
+              echo "### Conflicts"
+              echo
+              echo '```'
+              echo "$CONFLICTS"
+              echo '```'
+              echo
+              echo "Resolve locally — it satisfies the ancestry check identically and"
+              echo "closes this PR automatically:"
+              echo
+              echo '```bash'
+              echo "git fetch upstream && git switch ${FORK_BRANCH}"
+              echo "git merge upstream/${UPSTREAM_BRANCH}"
+              echo '```'
+              echo
+              echo "Keep the fork's release workflow and the Releasing section of"
+              echo "\`AGENTS.md\`. For the version, take upstream's new base and reset the"
+              echo "fork counter (e.g. \`0.1.39+zs1\`)."
+              echo
+            fi
+            echo "CI does not run here — PRs opened with \`GITHUB_TOKEN\` do not trigger"
+            echo "other workflows. Run \`make lint\` and \`make test\` locally after merging,"
+            echo "then run the \`garmin-release\` skill."
+          } > /tmp/pr-body.md
+
+          gh pr create --base "${FORK_BRANCH}" --head "${SYNC_BRANCH}" \
+            --title "$title" --body-file /tmp/pr-body.md
