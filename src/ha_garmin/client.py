@@ -2309,6 +2309,7 @@ class GarminClient:
         optimal_bedtime = None
         wake_time = None
         optimal_wake_time = None
+        avg_sleep_respiration_value = None
 
         if sleep_data:
             try:
@@ -2323,6 +2324,12 @@ class GarminClient:
                 rem_sleep_seconds = daily_sleep.get("remSleepSeconds")
                 awake_sleep_seconds = daily_sleep.get("awakeSleepSeconds")
                 nap_time_seconds = daily_sleep.get("napTimeSeconds")
+                # Only meaningful average Garmin's API exposes for respiration
+                # (home-assistant-garmin_connect#568); the summary endpoint
+                # only has day-wide latest/lowest/highest, and a client-side
+                # average from those is unreliable since the read frequency
+                # backing them varies.
+                avg_sleep_respiration_value = daily_sleep.get("avgRespirationValue")
                 unmeasurable_sleep_seconds = daily_sleep.get("unmeasurableSleepSeconds")
                 sleep_need_data = daily_sleep.get("sleepNeed") or {}
                 next_sleep_need_data = daily_sleep.get("nextSleepNeed") or {}
@@ -2401,6 +2408,7 @@ class GarminClient:
             "optimalBedtime": optimal_bedtime,
             "wakeTime": wake_time,
             "optimalWakeTime": optimal_wake_time,
+            "avgSleepRespirationValue": avg_sleep_respiration_value,
         }
         return _add_computed_fields(data)
 
