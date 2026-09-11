@@ -1,5 +1,6 @@
 """Tests for GarminClient."""
 
+import asyncio
 import re
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -279,6 +280,49 @@ class TestGarminClient:
 
         assert "eBikeBatteryRemaining" not in data["lastActivity"]
         assert mock_summary.await_count == retry_limit
+
+    async def test_get_ebike_fields_concurrent_calls_do_not_race(self):
+        """Overlapping callers must not let one clobber the other's result (#527).
+
+        Regression test: two callers racing on the same activity_id used to
+        both see an empty cache, both fetch, and whichever wrote last (even
+        an empty/failed result) won -- silently discarding a concurrent
+        successful fetch. The lock must serialize them so the second caller
+        observes the first's finished, cached result instead of re-fetching.
+        """
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        good_summary = {
+            "activityId": 1,
+            "eBikeBatteryRemaining": 64,
+            "eBikeBatteryUsage": 8,
+            "eBikeMaxAssistModes": 7,
+        }
+        call_count = 0
+
+        async def slow_success(_activity_id):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)  # yield control so a second caller can start
+            return good_summary
+
+        with patch.object(client, "get_activity", side_effect=slow_success):
+            results = await asyncio.gather(
+                client._get_ebike_fields(1),
+                client._get_ebike_fields(1),
+            )
+
+        # Second caller waited for the lock and got the cached result instead
+        # of re-fetching -- one call, not two.
+        assert call_count == 1
+        expected = {
+            "eBikeBatteryRemaining": 64,
+            "eBikeBatteryUsage": 8,
+            "eBikeMaxAssistModes": 7,
+        }
+        assert results[0] == expected
+        assert results[1] == expected
 
     async def test_fetch_activity_data_skips_summary_for_non_rides(self):
         """Test fetch_activity_data does not fetch the summary for non-ride activities."""
