@@ -81,7 +81,7 @@ fork-profile:
   upstream-default-branch: main
   fork-owner: Zensqrl
   deploy-target: wheel attached to a GitHub release, pinned by direct reference in the integration's manifest.json
-  version-scheme: PEP 440 local version — <upstream base>+zs<n>, e.g. 0.1.38+zs1
+  version-scheme: PEP 440 local version — <upstream base>+zs<n>, e.g. 0.1.37+zs1
   overlay:
     - .github/workflows/release.yml
     - .github/workflows/upstream-sync.yml
@@ -97,7 +97,9 @@ fork-profile:
 
 **Never published to PyPI** — do not run `make publish` or `twine upload`. Pushing a `v<version>` tag triggers [release.yml](.github/workflows/release.yml), which verifies the tag matches `pyproject.toml`, builds the wheel and sdist on GitHub's runners, and attaches them to a GitHub release. The integration consumes that wheel URL directly from its `manifest.json`.
 
-Fork builds carry a local version so they are unmistakable and sort above the upstream release they are based on: upstream `0.1.38` → `0.1.38+zs1`, tag `v0.1.38+zs1`, wheel `ha_garmin-0.1.38+zs1-py3-none-any.whl`. Reset the counter when the upstream base moves. If GitHub mangles the `+` in an asset filename, fall back to `.post1`.
+Fork builds carry a local version so they are unmistakable and sort above the upstream release they are based on: upstream `0.1.37` → `0.1.37+zs1`, tag `v0.1.37+zs1`, wheel `ha_garmin-0.1.37+zs1-py3-none-any.whl`. Reset the counter when the upstream base moves.
+
+The `+` is safe end to end, verified on the first release: GitHub keeps it in the asset name, serves the download URL with `%2B`, and both the literal and encoded forms return 200 and install under pip. Pin the literal form — it is readable and matches the filename.
 
 Version bumps live on `main` only and never appear in an upstream PR.
 
