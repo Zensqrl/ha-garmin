@@ -107,7 +107,7 @@ Optimized methods that group related API calls for Home Assistant coordinators:
 
 | Method | API Calls | Data Returned |
 | ------ | --------- | ------------- |
-| `fetch_core_data()` | 3 | Steps, distance, calories, HR, stress, sleep, body battery, SPO2 |
+| `fetch_core_data()` | 4 | Steps, distance, calories, HR, stress, sleep, body battery, SPO2, intraday Body Battery + stress timelines |
 | `fetch_body_data()` | 3 | Weight, BMI, body fat, hydration, fitness age |
 | `fetch_activity_data()` | 4+ | Activities, workouts, HR zones, polylines |
 | `fetch_training_data()` | 7 | Training readiness, status, HRV, lactate, endurance/hill scores |
@@ -157,6 +157,7 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | `get_body_composition()` | Weight, BMI, body fat |
 | `get_fitness_age()` | Fitness age metrics |
 | `get_hydration_data()` | Daily hydration |
+| `get_daily_stress(target_date)` | Raw intraday stress + Body Battery payload for any date (defaults to today) |
 | `get_activities()` | Most recent activities (newest first, no date filter) |
 | `get_activity(activity_id)` | Single activity summary (includes e-bike fields) |
 | `get_activity_details()` | Detailed activity with polyline |
@@ -195,6 +196,42 @@ The library automatically adds computed fields for convenience:
 - **Weight**: `weight` (grams) → `weightKg`
 - **Stress**: `stressQualifier` → `stressQualifierText` (capitalized)
 - **Nested flattening**: HRV status, training readiness, scores
+
+### Intraday timelines
+
+`fetch_core_data()` adds three keys built from the `dailyStress` endpoint, which
+returns the stress and Body Battery series in a single response:
+
+| Key | Type | Meaning |
+| --- | ---- | ------- |
+| `bodyBatteryTimeline` | `list[list[int]]` | `[[epoch_ms, level], ...]`, level 0-100 |
+| `stressTimeline` | `list[list[int]]` | `[[epoch_ms, stress_level], ...]` |
+| `intradayCalendarDate` | `date \| None` | Calendar day the two series belong to |
+
+Both series are sorted oldest first. Timestamps are **epoch milliseconds UTC**,
+passed through verbatim — Garmin does not ship a local-time variant of these
+arrays, so render them in the consumer's timezone.
+
+Column positions are resolved from the `stressValueDescriptorsDTOList` /
+`bodyBatteryValueDescriptorDTOList` descriptors in the response when Garmin
+sends them, falling back to the documented column order otherwise. Rows that are
+not lists, are too short, or carry a non-numeric timestamp or value are dropped.
+
+Garmin's negative stress sentinels (`-1` unmeasurable, `-2` no reading) are real
+values and are preserved as-is rather than translated into friendly states. Both
+series only cover the requested day, are gappy wherever the watch was off the
+wrist, and only advance as far as the last device sync.
+
+`get_daily_stress(target_date)` and `fetch_core_data(target_date)` both accept an
+arbitrary date and default to today only when the argument is omitted, so
+backfilling or re-reading an earlier day is a plain call:
+
+```python
+from ha_garmin.client import _transform_daily_stress
+
+raw = await client.get_daily_stress(date(2025, 6, 3))
+timelines = _transform_daily_stress(raw)
+```
 
 ## License
 
