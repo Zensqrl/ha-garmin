@@ -616,6 +616,7 @@ class TestGarminClient:
                     "optimalSleepWindowEndMins": 20,
                 },
                 "sleepScores": {"overall": {"value": 85}},
+                "avgRespirationValue": 14.2,
             }
         }
 
@@ -653,6 +654,7 @@ class TestGarminClient:
         assert data["optimalBedtime"] == datetime(2026, 4, 12, 20, 40, tzinfo=UTC)
         assert data["wakeTime"] == datetime(2026, 4, 12, 3, 57, 47, tzinfo=UTC)
         assert data["optimalWakeTime"] == datetime(2026, 4, 13, 4, 30, tzinfo=UTC)
+        assert data["avgSleepRespirationValue"] == 14.2
 
     async def test_fetch_core_data_transient_error_does_not_use_yesterday(self):
         """Test a transient 502/503 does not get papered over with yesterday's summary.
