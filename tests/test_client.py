@@ -1564,6 +1564,70 @@ class TestSecurityAuditHardening:
 
         assert data["sensors"] == sensor_payload
 
+    async def test_fetch_gear_data_aggregates_solar_readings(self):
+        """Solar intensity must aggregate the whole day, not just the latest reading.
+
+        The latest reading alone reflects only the moment of the last sync,
+        which is way off from the day as a whole -- e.g. syncing in the
+        evening reads near 0% even on a sunny day
+        (home-assistant-garmin_connect#508).
+        """
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        profile = MagicMock()
+        profile.profile_id = 999
+
+        device = {"deviceId": 456, "productDisplayName": "Instinct 2X Solar"}
+
+        solar_payload = {
+            "solarDailyDataDTOs": [
+                {
+                    "solarInputReadings": [
+                        {
+                            "solarUtilization": 0,
+                            "activityTimeGainMs": 0,
+                            "readingTimestampGmt": "2026-04-12T06:00:00.0",
+                        },
+                        {
+                            "solarUtilization": 45,
+                            "activityTimeGainMs": 300000,
+                            "readingTimestampGmt": "2026-04-12T12:00:00.0",
+                        },
+                        {
+                            "solarUtilization": 80,
+                            "activityTimeGainMs": 600000,
+                            "readingTimestampGmt": "2026-04-12T14:00:00.0",
+                        },
+                        # Evening sync -- this is the only reading the old
+                        # "latest" logic surfaced.
+                        {
+                            "solarUtilization": 2,
+                            "activityTimeGainMs": 0,
+                            "readingTimestampGmt": "2026-04-12T20:00:00.0",
+                        },
+                    ]
+                }
+            ]
+        }
+
+        with (
+            patch.object(client, "get_user_profile", return_value=profile),
+            patch.object(client, "get_gear", return_value=[]),
+            patch.object(client, "get_gear_defaults", return_value=[]),
+            patch.object(client, "get_devices", return_value=[device]),
+            patch.object(client, "get_device_last_used", return_value={}),
+            patch.object(client, "get_device_alarms", return_value=[]),
+            patch.object(client, "get_sensors", return_value=[]),
+            patch.object(client, "get_device_solar_data", return_value=solar_payload),
+        ):
+            data = await client.fetch_gear_data()
+
+        entry = data["solarIntensity"][0]
+        assert entry["solarUtilization"] == 2  # latest reading, unchanged
+        assert entry["avgSolarUtilization"] == 31.8  # (0+45+80+2)/4
+        assert entry["totalActivityTimeGainMinutes"] == 15  # (300000+600000)/60000
+
     async def test_set_active_gear_rejects_unknown_activity_type(self):
         auth = _make_auth()
         client = GarminClient(auth)
