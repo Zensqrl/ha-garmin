@@ -20,6 +20,7 @@ from .const import (
     BLOOD_PRESSURE_URL,
     BODY_COMPOSITION_URL,
     DAILY_STEPS_URL,
+    DAILY_STRESS_URL,
     DEFAULT_HEADERS,
     DEVICE_LAST_USED_URL,
     DEVICE_SOLAR_URL,
@@ -687,6 +688,125 @@ def _transform_nutrition_log(log: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Column order of the dailyStress value arrays, used only when Garmin omits the
+# matching descriptor list from the response. Mirrors the keys the endpoint
+# itself reports in stressValueDescriptorsDTOList /
+# bodyBatteryValueDescriptorDTOList.
+_STRESS_VALUE_COLUMNS = ("timestamp", "stressLevel")
+_BODY_BATTERY_VALUE_COLUMNS = (
+    "timestamp",
+    "bodyBatteryStatus",
+    "bodyBatteryLevel",
+    "bodyBatteryVersion",
+)
+
+
+def _resolve_column_index(
+    descriptors: Any, wanted: str, fallback: tuple[str, ...]
+) -> int | None:
+    """Find a column's position in a Garmin value array.
+
+    Prefers the descriptor list Garmin ships alongside the array, so a column
+    being reordered or inserted upstream cannot silently shift the values.
+    """
+    if isinstance(descriptors, list):
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            key = next(
+                (v for k, v in descriptor.items() if k.endswith("DescriptorKey")),
+                None,
+            )
+            index = next(
+                (v for k, v in descriptor.items() if k.endswith("DescriptorIndex")),
+                None,
+            )
+            if key == wanted and isinstance(index, int) and index >= 0:
+                return index
+        _LOGGER.debug("Descriptor list has no column %s, using fallback", wanted)
+    if wanted in fallback:
+        return fallback.index(wanted)
+    return None
+
+
+def _normalize_intraday_series(
+    rows: Any, timestamp_index: int | None, value_index: int | None
+) -> list[list[int]]:
+    """Normalize a Garmin value array to sorted [[epoch_ms, value], ...].
+
+    Timestamps are epoch milliseconds UTC, taken verbatim from Garmin (these
+    arrays carry no local-time variant). Rows that are not lists, are too short
+    for the resolved columns, or hold a non-numeric timestamp or value are
+    dropped. Garmin's negative stress sentinels (-1 unmeasurable, -2 no
+    reading) are numeric and are preserved as-is rather than reinterpreted.
+    """
+    if not isinstance(rows, list) or timestamp_index is None or value_index is None:
+        return []
+
+    series: list[list[int]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            continue
+        if len(row) <= max(timestamp_index, value_index):
+            continue
+        timestamp = row[timestamp_index]
+        value = row[value_index]
+        if isinstance(timestamp, bool) or isinstance(value, bool):
+            continue
+        if not isinstance(timestamp, (int, float)):
+            continue
+        if not isinstance(value, (int, float)):
+            continue
+        series.append([int(timestamp), int(value)])
+
+    series.sort(key=lambda point: point[0])
+    return series
+
+
+def _transform_daily_stress(raw: dict[str, Any]) -> dict[str, Any]:
+    """Map a raw dailyStress payload to flat intraday timeline keys.
+
+    The endpoint returns both series in one response, so both are normalized
+    here to [[epoch_ms, value], ...] sorted oldest first.
+    """
+    from contextlib import suppress
+
+    stress_descriptors = raw.get("stressValueDescriptorsDTOList")
+    body_battery_descriptors = raw.get("bodyBatteryValueDescriptorDTOList")
+
+    calendar_date = raw.get("calendarDate")
+    intraday_date: date | None = None
+    if isinstance(calendar_date, date):
+        intraday_date = calendar_date
+    elif isinstance(calendar_date, str):
+        with suppress(ValueError):
+            intraday_date = date.fromisoformat(calendar_date)
+
+    return {
+        "stressTimeline": _normalize_intraday_series(
+            raw.get("stressValuesArray"),
+            _resolve_column_index(
+                stress_descriptors, "timestamp", _STRESS_VALUE_COLUMNS
+            ),
+            _resolve_column_index(
+                stress_descriptors, "stressLevel", _STRESS_VALUE_COLUMNS
+            ),
+        ),
+        "bodyBatteryTimeline": _normalize_intraday_series(
+            raw.get("bodyBatteryValuesArray"),
+            _resolve_column_index(
+                body_battery_descriptors, "timestamp", _BODY_BATTERY_VALUE_COLUMNS
+            ),
+            _resolve_column_index(
+                body_battery_descriptors,
+                "bodyBatteryLevel",
+                _BODY_BATTERY_VALUE_COLUMNS,
+            ),
+        ),
+        "intradayCalendarDate": intraday_date,
+    }
+
+
 class GarminClient:
     """Garmin Connect API client."""
 
@@ -1206,6 +1326,20 @@ class GarminClient:
             target_date = date.today()
 
         url = f"{HYDRATION_URL}/{target_date.isoformat()}"
+        data = await self._request("GET", url)
+        return data if isinstance(data, dict) else {}
+
+    async def get_daily_stress(self, target_date: date | None = None) -> dict[str, Any]:
+        """Get the raw intraday stress / Body Battery payload for a date.
+
+        A single response carries both stressValuesArray and
+        bodyBatteryValuesArray. Pass it through _transform_daily_stress for
+        the normalized [[epoch_ms, value], ...] timelines.
+        """
+        if target_date is None:
+            target_date = date.today()
+
+        url = f"{DAILY_STRESS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
 
@@ -2231,9 +2365,10 @@ class GarminClient:
     # ========== Multi-Coordinator Fetch Methods ==========
 
     async def fetch_core_data(self, target_date: date | None = None) -> dict[str, Any]:
-        """Fetch core data: summary, daily steps, sleep.
+        """Fetch core data: summary, daily steps, sleep, intraday timelines.
 
-        API calls: get_user_summary, get_daily_steps, get_sleep_data (3 calls)
+        API calls: get_user_summary, get_daily_steps, get_sleep_data,
+        get_daily_stress (4 calls)
         """
         if target_date is None:
             target_date = date.today()
@@ -2382,8 +2517,16 @@ class GarminClient:
             except (KeyError, TypeError):
                 pass
 
+        # Intraday Body Battery + stress timelines. One extra GET per poll:
+        # the same response carries both series, and keeping it here means the
+        # timelines stay in step with the scalar body battery / stress sensors
+        # that come out of this same fetch.
+        daily_stress = await self._safe_call(self.get_daily_stress, target_date)
+        intraday = _transform_daily_stress(daily_stress or {})
+
         data = {
             **summary_raw,
+            **intraday,
             "yesterdaySteps": yesterday_steps,
             "yesterdayDistance": yesterday_distance,
             "weeklyStepAvg": weekly_step_avg,
