@@ -6,14 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
 
 env:
   UPSTREAM_REPO: cyberjunky/ha-garmin
   UPSTREAM_BRANCH: main
   FORK_BRANCH: main
-  SYNC_BRANCH: sync/upstream
 
 jobs:
   sync:
@@ -36,13 +35,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          upstream_owner="${UPSTREAM_REPO%%/*}"
+          echo "head_label=${upstream_owner}:${UPSTREAM_BRANCH}" >> "$GITHUB_OUTPUT"
+
           if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
             echo "Already contains upstream/${UPSTREAM_BRANCH}."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ -n "$(gh pr list --state open --base "${FORK_BRANCH}" --head "${SYNC_BRANCH}" --json number --jq '.[0].number')" ]; then
+          open=$(gh pr list --state open --base "${FORK_BRANCH}" \
+            --json number,headRepositoryOwner,headRefName \
+            --jq "[.[] | select(.headRepositoryOwner.login==\"${upstream_owner}\" and .headRefName==\"${UPSTREAM_BRANCH}\")] | length")
+          if [ "$open" != "0" ]; then
             echo "A sync PR is already open."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -50,7 +55,9 @@ jobs:
 
           # A previously merged sync PR whose head is no longer an ancestor means
           # that merge was squashed or rebased, which breaks the ancestry check.
-          prev=$(gh pr list --state merged --base "${FORK_BRANCH}" --head "${SYNC_BRANCH}" --limit 1 --json headRefOid --jq '.[0].headRefOid // empty')
+          prev=$(gh pr list --state merged --base "${FORK_BRANCH}" --limit 20 \
+            --json headRepositoryOwner,headRefName,headRefOid \
+            --jq "[.[] | select(.headRepositoryOwner.login==\"${upstream_owner}\" and .headRefName==\"${UPSTREAM_BRANCH}\")][0].headRefOid // empty")
           if [ -n "$prev" ] && git cat-file -e "$prev" 2>/dev/null && ! git merge-base --is-ancestor "$prev" HEAD; then
             echo "broken_history=true" >> "$GITHUB_OUTPUT"
           fi
@@ -71,10 +78,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CONFLICTS: ${{ steps.assess.outputs.conflicts }}
+          HEAD_LABEL: ${{ steps.assess.outputs.head_label }}
           BROKEN: ${{ steps.assess.outputs.broken_history }}
         run: |
-          git push --force origin "refs/remotes/upstream/${UPSTREAM_BRANCH}:refs/heads/${SYNC_BRANCH}"
-
           title="Sync with ${UPSTREAM_REPO}"
           [ -n "$CONFLICTS" ] && title="[CONFLICTS] ${title}"
 
@@ -106,15 +112,13 @@ jobs:
               echo "git merge upstream/${UPSTREAM_BRANCH}"
               echo '```'
               echo
-              echo "Keep the fork's release workflow and the Releasing section of"
-              echo "\`AGENTS.md\`. For the version, take upstream's new base and reset the"
-              echo "fork counter (e.g. \`0.1.39+zs1\`)."
+              echo "Keep the fork's version of every overlay path. For version numbers,"
+              echo "take upstream's new base and reset the fork counter."
               echo
             fi
             echo "CI does not run here — PRs opened with \`GITHUB_TOKEN\` do not trigger"
-            echo "other workflows. Run \`make lint\` and \`make test\` locally after merging,"
-            echo "then run the \`garmin-release\` skill."
+            echo "other workflows. Run the verify commands locally after merging, then release."
           } > /tmp/pr-body.md
 
-          gh pr create --base "${FORK_BRANCH}" --head "${SYNC_BRANCH}" \
+          gh pr create --base "${FORK_BRANCH}" --head "${HEAD_LABEL}" \
             --title "$title" --body-file /tmp/pr-body.md
