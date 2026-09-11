@@ -73,6 +73,60 @@ class TestGarminClient:
         params = mock_req.call_args.kwargs.get("params") or mock_req.call_args[0][2]
         assert params == {"start": 0, "limit": 10}
 
+    async def test_get_scheduled_workouts_month_is_zero_indexed(self):
+        """Garmin's calendar endpoint is 0-indexed for month; the public API isn't."""
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        captured = {}
+
+        async def fake_request(method, url):
+            captured["url"] = url
+            return {}
+
+        with patch.object(client, "_request", side_effect=fake_request):
+            await client.get_scheduled_workouts(2026, 1)
+            assert captured["url"].endswith("/year/2026/month/0")
+
+            await client.get_scheduled_workouts(2026, 12)
+            assert captured["url"].endswith("/year/2026/month/11")
+
+    async def test_get_scheduled_workouts_rejects_invalid_month(self):
+        auth = _make_auth()
+        client = GarminClient(auth)
+        with pytest.raises(ValueError, match="month must be between 1 and 12"):
+            await client.get_scheduled_workouts(2026, 13)
+        with pytest.raises(ValueError, match="month must be between 1 and 12"):
+            await client.get_scheduled_workouts(2026, 0)
+
+    async def test_fetch_activity_data_includes_scheduled_workouts(self):
+        """fetch_activity_data must surface the training calendar (home-assistant-garmin_connect#521)."""
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        calendar_payload = {"calendarItems": [{"date": "2026-04-13"}]}
+
+        with (
+            patch.object(client, "get_activities", new_callable=AsyncMock) as mock_acts,
+            patch.object(
+                client, "get_workouts", new_callable=AsyncMock
+            ) as mock_workouts,
+            patch.object(
+                client, "get_activity_hr_in_timezones", new_callable=AsyncMock
+            ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
+        ):
+            mock_acts.return_value = []
+            mock_workouts.return_value = []
+            mock_hr.return_value = []
+            mock_calendar.return_value = calendar_payload
+            data = await client.fetch_activity_data()
+
+        assert data["scheduledWorkouts"] == calendar_payload
+        mock_calendar.assert_awaited_once()
+
     async def test_fetch_activity_data_uses_recency_not_window(self):
         """Test fetch_activity_data returns lastActivity even for old activities (#519)."""
         auth = _make_auth()
@@ -94,10 +148,14 @@ class TestGarminClient:
             patch.object(
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
         ):
             mock_acts.return_value = [old_activity]
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_calendar.return_value = {}
             data = await client.fetch_activity_data()
 
         mock_acts.assert_awaited_once_with(0, GarminClient._RECENT_ACTIVITIES_LIMIT)
@@ -134,10 +192,14 @@ class TestGarminClient:
             patch.object(
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
         ):
             mock_acts.return_value = activities
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_calendar.return_value = {}
             data = await client.fetch_activity_data()
 
         assert len(data["lastActivities"]) == 15
@@ -172,11 +234,15 @@ class TestGarminClient:
             patch.object(
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
         ):
             mock_acts.return_value = [ride]
             mock_summary.return_value = summary
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_calendar.return_value = {}
             data = await client.fetch_activity_data()
 
         mock_summary.assert_awaited_once_with(7)
@@ -222,10 +288,14 @@ class TestGarminClient:
             patch.object(
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
         ):
             mock_acts.return_value = [ride]
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_calendar.return_value = {}
 
             mock_summary.return_value = empty_summary
             first_poll = await client.fetch_activity_data()
@@ -268,11 +338,15 @@ class TestGarminClient:
             patch.object(
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
         ):
             mock_acts.return_value = [ride]
             mock_summary.return_value = {"activityId": 10}
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_calendar.return_value = {}
 
             retry_limit = client._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
             for _ in range(retry_limit + 3):
@@ -347,10 +421,14 @@ class TestGarminClient:
             patch.object(
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
+            patch.object(
+                client, "get_scheduled_workouts", new_callable=AsyncMock
+            ) as mock_calendar,
         ):
             mock_acts.return_value = [run]
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_calendar.return_value = {}
             data = await client.fetch_activity_data()
 
         mock_summary.assert_not_awaited()

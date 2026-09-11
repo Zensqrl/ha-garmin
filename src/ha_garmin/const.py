@@ -15,6 +15,7 @@ ACTIVITIES_URL = (
 ACTIVITIES_BY_DATE_URL = f"{GARMIN_CONNECT_API}/activitylist-service/activities/byDate"
 ACTIVITY_DETAILS_URL = f"{GARMIN_CONNECT_API}/activity-service/activity"
 WORKOUTS_URL = f"{GARMIN_CONNECT_API}/workout-service/workouts"
+CALENDAR_URL = f"{GARMIN_CONNECT_API}/calendar-service/year"
 
 # Wellness endpoints
 HRV_URL = f"{GARMIN_CONNECT_API}/hrv-service/hrv"
