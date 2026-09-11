@@ -727,6 +727,11 @@ class GarminClient:
         self._profile_cache: UserProfile | None = None
         # (activity_id, fields, consecutive_empty_polls)
         self._ebike_fields_cache: tuple[int, dict[str, Any], int] | None = None
+        # Guards the cache above: without it, two overlapping callers (e.g. an
+        # overlapping coordinator refresh) can both race past the cache check,
+        # and a transient failure on one can overwrite the other's good result
+        # with an empty one (home-assistant-garmin_connect#527).
+        self._ebike_fields_lock = asyncio.Lock()
 
     def _get_url(self, url: str) -> str:
         """Resolve URL to correct connectapi domain."""
@@ -1159,31 +1164,38 @@ class GarminClient:
         (see _EBIKE_FIELDS_EMPTY_RETRY_LIMIT). An empty result is never
         cached indefinitely on the first miss, so a slow backend doesn't
         permanently poison the cache for that activity.
-        """
-        cached_empty_polls = 0
-        if (
-            self._ebike_fields_cache is not None
-            and self._ebike_fields_cache[0] == activity_id
-        ):
-            cached_fields = self._ebike_fields_cache[1]
-            cached_empty_polls = self._ebike_fields_cache[2]
-            if (
-                cached_fields
-                or cached_empty_polls >= self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
-            ):
-                return cached_fields
 
-        summary = await self._safe_call(self.get_activity, activity_id) or {}
-        # Fields have been observed at the top level; check summaryDTO too
-        source = {**(summary.get("summaryDTO") or {}), **summary}
-        fields = {
-            key: source[key]
-            for key in EBIKE_ACTIVITY_KEYS
-            if source.get(key) is not None
-        }
-        empty_polls = 0 if fields else cached_empty_polls + 1
-        self._ebike_fields_cache = (activity_id, fields, empty_polls)
-        return fields
+        Locked end-to-end: an overlapping caller (e.g. two coordinator
+        refreshes in flight at once) must see this call's finished result
+        before deciding whether to fetch again, or a transient failure on
+        the second call could overwrite the first's good result with an
+        empty one (#527).
+        """
+        async with self._ebike_fields_lock:
+            cached_empty_polls = 0
+            if (
+                self._ebike_fields_cache is not None
+                and self._ebike_fields_cache[0] == activity_id
+            ):
+                cached_fields = self._ebike_fields_cache[1]
+                cached_empty_polls = self._ebike_fields_cache[2]
+                if (
+                    cached_fields
+                    or cached_empty_polls >= self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
+                ):
+                    return cached_fields
+
+            summary = await self._safe_call(self.get_activity, activity_id) or {}
+            # Fields have been observed at the top level; check summaryDTO too
+            source = {**(summary.get("summaryDTO") or {}), **summary}
+            fields = {
+                key: source[key]
+                for key in EBIKE_ACTIVITY_KEYS
+                if source.get(key) is not None
+            }
+            empty_polls = 0 if fields else cached_empty_polls + 1
+            self._ebike_fields_cache = (activity_id, fields, empty_polls)
+            return fields
 
     async def get_activity_details(
         self, activity_id: int, max_chart_size: int = 100, max_poly_size: int = 4000
