@@ -656,6 +656,64 @@ class TestGarminClient:
         assert data["optimalWakeTime"] == datetime(2026, 4, 13, 4, 30, tzinfo=UTC)
         assert data["avgSleepRespirationValue"] == 14.2
 
+    async def test_fetch_core_data_bedtime_uses_gmt_local_delta_for_offset(self):
+        """bedtime/wake_time must not silently assume UTC+0 (home-assistant-garmin_connect#564).
+
+        Real-world payloads have been seen with no explicit timezoneOffset
+        field in dailySleepDTO and no SLEEP event in
+        bodyBatteryActivityEventList either -- the previous fallback chain
+        silently defaulted to a 0 offset in that case, storing the local
+        wall-clock time mislabeled as UTC. Home Assistant's own UTC-to-local
+        display conversion then shifted it by the viewer's offset *again*,
+        showing bedtime/wake_time hours later than reality. The GMT/Local
+        timestamp pair Garmin always sends alongside each sleep timestamp
+        must be used instead of falling through to 0.
+        """
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        profile_payload = {"id": 1, "profileId": 2, "displayName": "testuser"}
+        summary_payload = {
+            "dailyStepGoal": 10000,
+            "totalSteps": 5000,
+            "totalDistanceMeters": 4000,
+            # Deliberately no bodyBatteryActivityEventList / timezoneOffset
+            # anywhere -- the exact shape that used to default to 0.
+        }
+        steps_payload = []
+
+        # Real UTC instants for a French UTC+2 (CEST) user: bedtime 22:44,
+        # wake 07:06 local.
+        gmt_start = datetime(2026, 8, 26, 20, 44, 0, tzinfo=UTC)
+        gmt_end = datetime(2026, 8, 27, 5, 6, 0, tzinfo=UTC)
+        offset = timedelta(minutes=120)
+
+        sleep_payload = {
+            "dailySleepDTO": {
+                "sleepStartTimestampGMT": int(gmt_start.timestamp() * 1000),
+                "sleepStartTimestampLocal": int((gmt_start + offset).timestamp() * 1000),
+                "sleepEndTimestampGMT": int(gmt_end.timestamp() * 1000),
+                "sleepEndTimestampLocal": int((gmt_end + offset).timestamp() * 1000),
+                "sleepScores": {"overall": {"value": 84}},
+            }
+        }
+
+        responses = [
+            _mock_response(profile_payload),
+            _mock_response(summary_payload),
+            _mock_response(steps_payload),
+            _mock_response(sleep_payload),
+        ]
+
+        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            mock_thread.side_effect = responses
+            data = await client.fetch_core_data(date(2026, 8, 27))
+
+        # Stored as the true UTC instant, so a UTC+2 viewer's own display
+        # conversion correctly lands back on 22:44 / 07:06, not 00:44 / 09:06.
+        assert data["bedtime"] == gmt_start
+        assert data["wakeTime"] == gmt_end
+
     async def test_fetch_core_data_transient_error_does_not_use_yesterday(self):
         """Test a transient 502/503 does not get papered over with yesterday's summary.
 
