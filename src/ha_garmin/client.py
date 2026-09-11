@@ -2404,6 +2404,15 @@ class GarminClient:
         }
         return _add_computed_fields(data)
 
+    # How many recent activities to pull for `lastActivities`. Consumers (e.g.
+    # home-assistant-garmin_connect#567) derive a rolling-week count from this
+    # list; fetching only 10 meant that count silently pinned at 10 forever
+    # for anyone averaging 10+ activities a week, since the fetch itself, not
+    # the 7-day filter, was the actual ceiling. 25 is comfortably above what
+    # all but the most prolific multi-activity-per-day users would log in a
+    # week, while staying a single bounded list call.
+    _RECENT_ACTIVITIES_LIMIT = 25
+
     async def fetch_activity_data(
         self, target_date: date | None = None
     ) -> dict[str, Any]:
@@ -2414,12 +2423,14 @@ class GarminClient:
                    plus get_activity for rides (e-bike fields, #527)
 
         target_date is kept for signature compatibility; activities are
-        fetched by recency (newest 10), not by date.
+        fetched by recency (newest _RECENT_ACTIVITIES_LIMIT), not by date.
         """
 
-        # The 10 most recent activities regardless of age (newest first), so
+        # The most recent activities regardless of age (newest first), so
         # lastActivity never goes blank after an inactive week (issue #519).
-        recent_activities = await self._safe_call(self.get_activities, 0, 10)
+        recent_activities = await self._safe_call(
+            self.get_activities, 0, self._RECENT_ACTIVITIES_LIMIT
+        )
         last_activity: dict[str, Any] = {}
         if recent_activities:
             last_activity = dict(recent_activities[0])

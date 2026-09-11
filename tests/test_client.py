@@ -99,9 +99,47 @@ class TestGarminClient:
             mock_hr.return_value = []
             data = await client.fetch_activity_data()
 
-        mock_acts.assert_awaited_once_with(0, 10)
+        mock_acts.assert_awaited_once_with(0, GarminClient._RECENT_ACTIVITIES_LIMIT)
         assert data["lastActivity"]["activityId"] == 42
         assert len(data["lastActivities"]) == 1
+
+    async def test_fetch_activity_data_returns_more_than_ten_recent(self):
+        """lastActivities must not be capped at 10 (home-assistant-garmin_connect#567).
+
+        A consumer that derives a rolling-7-day count from `lastActivities`
+        needs the pool itself to hold more than a week's worth of activities
+        for an active user, or that count silently pins at the fetch limit
+        forever instead of tracking real activity.
+        """
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        activities = [
+            {
+                "activityId": i,
+                "activityName": f"Activity {i}",
+                "activityType": {"typeKey": "running"},
+                "startTimeGMT": "2026-01-01T07:00:00",
+                "hasPolyline": False,
+            }
+            for i in range(15)
+        ]
+
+        with (
+            patch.object(client, "get_activities", new_callable=AsyncMock) as mock_acts,
+            patch.object(
+                client, "get_workouts", new_callable=AsyncMock
+            ) as mock_workouts,
+            patch.object(
+                client, "get_activity_hr_in_timezones", new_callable=AsyncMock
+            ) as mock_hr,
+        ):
+            mock_acts.return_value = activities
+            mock_workouts.return_value = []
+            mock_hr.return_value = []
+            data = await client.fetch_activity_data()
+
+        assert len(data["lastActivities"]) == 15
 
     async def test_fetch_activity_data_merges_ebike_fields(self):
         """Test fetch_activity_data merges e-bike fields from the summary endpoint (#527)."""
