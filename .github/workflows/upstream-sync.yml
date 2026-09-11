@@ -7,12 +7,13 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  issues: write
 
 env:
   UPSTREAM_REPO: cyberjunky/ha-garmin
   UPSTREAM_BRANCH: main
   FORK_BRANCH: main
+  ISSUE_TITLE_PREFIX: "Upstream sync:"
 
 jobs:
   sync:
@@ -30,95 +31,71 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream "${UPSTREAM_BRANCH}"
 
-      - name: Assess
-        id: assess
+      - name: Assess drift and file issue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          upstream_owner="${UPSTREAM_REPO%%/*}"
-          echo "head_label=${upstream_owner}:${UPSTREAM_BRANCH}" >> "$GITHUB_OUTPUT"
+          title="${ISSUE_TITLE_PREFIX} ${UPSTREAM_REPO}"
+          existing=$(gh issue list --state open --search "\"${title}\" in:title" \
+            --json number,title --jq "[.[] | select(.title | startswith(\"${title}\"))][0].number // empty")
 
           if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
-            echo "Already contains upstream/${UPSTREAM_BRANCH}."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Up to date with upstream/${UPSTREAM_BRANCH}."
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --comment "\`${FORK_BRANCH}\` now contains \`upstream/${UPSTREAM_BRANCH}\`. Closing."
+            fi
             exit 0
           fi
 
-          open=$(gh pr list --state open --base "${FORK_BRANCH}" \
-            --json number,headRepositoryOwner,headRefName \
-            --jq "[.[] | select(.headRepositoryOwner.login==\"${upstream_owner}\" and .headRefName==\"${UPSTREAM_BRANCH}\")] | length")
-          if [ "$open" != "0" ]; then
-            echo "A sync PR is already open."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # A previously merged sync PR whose head is no longer an ancestor means
-          # that merge was squashed or rebased, which breaks the ancestry check.
-          prev=$(gh pr list --state merged --base "${FORK_BRANCH}" --limit 20 \
-            --json headRepositoryOwner,headRefName,headRefOid \
-            --jq "[.[] | select(.headRepositoryOwner.login==\"${upstream_owner}\" and .headRefName==\"${UPSTREAM_BRANCH}\")][0].headRefOid // empty")
-          if [ -n "$prev" ] && git cat-file -e "$prev" 2>/dev/null && ! git merge-base --is-ancestor "$prev" HEAD; then
-            echo "broken_history=true" >> "$GITHUB_OUTPUT"
-          fi
+          behind=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          log=$(git log --oneline --no-merges "HEAD..upstream/${UPSTREAM_BRANCH}" | head -30)
 
           git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}" >/dev/null 2>&1 || true
           conflicts=$(git diff --name-only --diff-filter=U)
           git merge --abort 2>/dev/null || git reset --hard
 
           {
-            echo "conflicts<<EOF"
-            echo "$conflicts"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-      - name: Open sync PR
-        if: steps.assess.outputs.skip == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CONFLICTS: ${{ steps.assess.outputs.conflicts }}
-          HEAD_LABEL: ${{ steps.assess.outputs.head_label }}
-          BROKEN: ${{ steps.assess.outputs.broken_history }}
-        run: |
-          title="Sync with ${UPSTREAM_REPO}"
-          [ -n "$CONFLICTS" ] && title="[CONFLICTS] ${title}"
-
-          {
-            echo "## Merge this with a merge commit"
+            echo "\`${FORK_BRANCH}\` is **${behind} commits behind** \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`."
             echo
-            echo "Do **not** squash or rebase. The sync automation asks"
-            echo '`git merge-base --is-ancestor upstream/'"${UPSTREAM_BRANCH}"' '"${FORK_BRANCH}"'`.'
-            echo "A squash keeps upstream's content but not its commits, so that check"
-            echo "stays false forever and this PR reopens every run."
+            echo "Sync locally — ask the agent to \"sync my fork\", or:"
             echo
-            if [ -n "$BROKEN" ]; then
-              echo "> **A previous sync PR was squashed or rebased.** The ancestry chain is"
-              echo "> broken; repair history before merging this one."
+            echo '```bash'
+            echo "git fetch upstream && git switch ${FORK_BRANCH}"
+            echo "git merge upstream/${UPSTREAM_BRANCH}"
+            echo '```'
+            echo
+            echo "Merge commit only. A squash keeps upstream's content but not its commits,"
+            echo "so the \`git merge-base --is-ancestor\` check this job runs stays false"
+            echo "forever and the issue reopens every week."
+            echo
+            if [ -n "$conflicts" ]; then
+              echo "### Expected conflicts"
+              echo
+              echo '```'
+              echo "$conflicts"
+              echo '```'
+              echo
+              echo "These should all be overlay or version lines with deterministic"
+              echo "resolutions — see the fork profile. Anything else means upstream"
+              echo "changed something the fork also modified, and needs judgement."
+              echo
+            else
+              echo "No conflicts — the merge is clean."
               echo
             fi
-            if [ -n "$CONFLICTS" ]; then
-              echo "### Conflicts"
-              echo
-              echo '```'
-              echo "$CONFLICTS"
-              echo '```'
-              echo
-              echo "Resolve locally — it satisfies the ancestry check identically and"
-              echo "closes this PR automatically:"
-              echo
-              echo '```bash'
-              echo "git fetch upstream && git switch ${FORK_BRANCH}"
-              echo "git merge upstream/${UPSTREAM_BRANCH}"
-              echo '```'
-              echo
-              echo "Keep the fork's version of every overlay path. For version numbers,"
-              echo "take upstream's new base and reset the fork counter."
-              echo
-            fi
-            echo "CI does not run here — PRs opened with \`GITHUB_TOKEN\` do not trigger"
-            echo "other workflows. Run the verify commands locally after merging, then release."
-          } > /tmp/pr-body.md
+            echo "### Upstream commits"
+            echo
+            echo '```'
+            echo "$log"
+            echo '```'
+            echo
+            echo "After merging, run the verify commands and release; a merge alone"
+            echo "changes nothing for consumers."
+          } > /tmp/issue-body.md
 
-          gh pr create --base "${FORK_BRANCH}" --head "${HEAD_LABEL}" \
-            --title "$title" --body-file /tmp/pr-body.md
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "${title} (${behind} behind)" --body-file /tmp/issue-body.md
+            echo "Updated issue #${existing}."
+          else
+            gh issue create --title "${title} (${behind} behind)" --body-file /tmp/issue-body.md
+          fi

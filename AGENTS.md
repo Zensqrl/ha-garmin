@@ -89,6 +89,9 @@ fork-profile:
     - .github/agents/
     - .github/skills/
     - AGENTS.md                 # the Releasing section only
+  sync-conflicts:               # deterministic, apply mechanically
+    pyproject.toml: take upstream's version as the new base, reset counter to +zs1
+    src/ha_garmin/__init__.py: same value as pyproject.toml
   verify:
     - make lint
     - make test
