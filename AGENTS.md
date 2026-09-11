@@ -85,7 +85,10 @@ fork-profile:
   overlay:
     - .github/workflows/release.yml
     - .github/workflows/upstream-sync.yml
-    - AGENTS.md          # the Releasing section only
+    - .github/prompts/          # all agent customization is fork-only
+    - .github/agents/
+    - .github/skills/
+    - AGENTS.md                 # the Releasing section only
   verify:
     - make lint
     - make test
