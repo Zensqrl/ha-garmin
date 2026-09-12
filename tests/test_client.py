@@ -1373,6 +1373,46 @@ class TestGarminClient:
 
         client._put_request.assert_not_called()
 
+    async def test_set_blood_pressure_includes_pulse_when_given(self):
+        """set_blood_pressure includes pulse in the payload when provided."""
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        post_payloads = []
+
+        async def fake_post(url, payload):
+            post_payloads.append((url, payload))
+            return {"success": True}
+
+        client._post_request = fake_post
+
+        await client.set_blood_pressure(120, 80, pulse=65)
+
+        assert len(post_payloads) == 1
+        _, payload = post_payloads[0]
+        assert payload["systolic"] == 120
+        assert payload["diastolic"] == 80
+        assert payload["pulse"] == 65
+
+    async def test_set_blood_pressure_omits_pulse_when_not_given(self):
+        """set_blood_pressure works without a pulse, matching Garmin Connect's own UI."""
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        post_payloads = []
+
+        async def fake_post(url, payload):
+            post_payloads.append((url, payload))
+            return {"success": True}
+
+        client._post_request = fake_post
+
+        result = await client.set_blood_pressure(120, 80)
+
+        assert result == {"success": True}
+        _, payload = post_payloads[0]
+        assert "pulse" not in payload
+
     async def test_get_nutrition_log_returns_dict(self):
         """Test get_nutrition_log returns dict from API response."""
         auth = _make_auth()

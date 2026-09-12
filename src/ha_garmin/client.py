@@ -1864,7 +1864,7 @@ class GarminClient:
         self,
         systolic: int,
         diastolic: int,
-        pulse: int,
+        pulse: int | None = None,
         timestamp: str | None = None,
         notes: str = "",
     ) -> dict[str, Any]:
@@ -1873,7 +1873,8 @@ class GarminClient:
         Args:
             systolic: Systolic blood pressure (70-260)
             diastolic: Diastolic blood pressure (40-150)
-            pulse: Pulse rate (20-250)
+            pulse: Pulse rate (20-250). Optional - Garmin Connect's own UI
+                accepts a blood pressure entry without a heart rate.
             timestamp: ISO timestamp (defaults to now)
             notes: Optional notes
         """
@@ -1899,10 +1900,11 @@ class GarminClient:
             "measurementTimestampGMT": fmt_ts(dt_gmt),
             "systolic": systolic,
             "diastolic": diastolic,
-            "pulse": pulse,
             "sourceType": "MANUAL",
             "notes": notes,
         }
+        if pulse is not None:
+            payload["pulse"] = pulse
 
         _LOGGER.debug("Blood pressure payload: %s", payload)
         return await self._post_request(BLOOD_PRESSURE_SET_URL, payload)
