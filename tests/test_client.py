@@ -196,6 +196,21 @@ class TestGarminClient:
                 return next_month_payload
             raise AssertionError(f"unexpected month requested: {year}-{month}")
 
+        goal_event_payload = [
+            {
+                "eventName": "5K Plan",
+                "date": "2026-11-21",
+                "eventType": "running",
+                "completionTarget": {"value": 5.0, "unit": "kilometer"},
+                "eventCustomization": {
+                    "trainingPlanType": "COACH_ATP",
+                    "projectedRaceTimeDurationSeconds": 1829,
+                    "predictedRaceTimeDurationSeconds": 2101,
+                    "enrollmentTime": "2026-09-11T12:39:16.350",
+                },
+            }
+        ]
+
         with (
             patch.object(client, "get_activities", new_callable=AsyncMock) as mock_acts,
             patch.object(
@@ -209,10 +224,14 @@ class TestGarminClient:
                 "get_scheduled_workouts",
                 side_effect=fake_get_scheduled_workouts,
             ) as mock_calendar,
+            patch.object(
+                client, "get_calendar_events_for_plan", new_callable=AsyncMock
+            ) as mock_goal,
         ):
             mock_acts.return_value = []
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_goal.return_value = goal_event_payload
             data = await client.fetch_activity_data()
 
         assert mock_calendar.await_count == 2
@@ -221,6 +240,13 @@ class TestGarminClient:
         assert data["todayScheduledWorkout"]["title"] == "Benchmark Run"
         assert data["nextScheduledWorkout"]["title"] == "Benchmark Run"
         assert data["nextScheduledWorkout"]["atpPlanId"] == 222
+
+        mock_goal.assert_awaited_once_with(222)
+        assert data["trainingPlanGoalEvent"]["eventName"] == "5K Plan"
+        assert data["trainingPlanGoalEvent"]["targetDistance"] == 5.0
+        assert data["trainingPlanGoalEvent"]["targetDistanceUnit"] == "kilometer"
+        assert data["trainingPlanGoalEvent"]["trainingPlanType"] == "COACH_ATP"
+        assert data["trainingPlanGoalEvent"]["projectedRaceTimeDurationSeconds"] == 1829
 
     async def test_fetch_activity_data_uses_recency_not_window(self):
         """Test fetch_activity_data returns lastActivity even for old activities (#519)."""

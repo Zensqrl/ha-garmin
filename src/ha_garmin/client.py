@@ -387,6 +387,31 @@ def _trim_calendar_workout_item(item: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k in CALENDAR_WORKOUT_ESSENTIAL_KEYS}
 
 
+def _trim_goal_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Trim a training plan's goal event to the fields that matter.
+
+    Target/projection fields live nested under eventCustomization; flattened
+    here so callers don't have to know that.
+    """
+    customization = event.get("eventCustomization") or {}
+    target = event.get("completionTarget") or {}
+    return {
+        "eventName": event.get("eventName"),
+        "date": event.get("date"),
+        "eventType": event.get("eventType"),
+        "targetDistance": target.get("value"),
+        "targetDistanceUnit": target.get("unit"),
+        "trainingPlanType": customization.get("trainingPlanType"),
+        "projectedRaceTimeDurationSeconds": customization.get(
+            "projectedRaceTimeDurationSeconds"
+        ),
+        "predictedRaceTimeDurationSeconds": customization.get(
+            "predictedRaceTimeDurationSeconds"
+        ),
+        "enrollmentTime": customization.get("enrollmentTime"),
+    }
+
+
 def _seconds_to_minutes(seconds: int | float | None) -> int | None:
     """Convert seconds to minutes, rounded to nearest integer."""
     if seconds is None:
@@ -2562,7 +2587,9 @@ class GarminClient:
         API calls: get_activities, get_activity_details,
                    get_activity_hr_in_timezones, get_workouts,
                    get_scheduled_workouts x2 (this + next month) (6 calls),
-                   plus get_activity for rides (e-bike fields, #527)
+                   plus get_activity for rides (e-bike fields, #527), plus
+                   get_calendar_events_for_plan when a scheduled workout
+                   carries an atpPlanId
 
         target_date is kept for signature compatibility; activities are
         fetched by recency (newest _RECENT_ACTIVITIES_LIMIT), not by date.
@@ -2652,6 +2679,18 @@ class GarminClient:
         )
         next_workout = scheduled_workouts[0] if scheduled_workouts else {}
 
+        # The plan's own goal event (target race, distance, projected time).
+        # atpPlanId (not the workout item's own trainingPlanId field, which
+        # has been observed as a stale 0) is the id calendar-service/events
+        # actually wants.
+        plan_id = next_workout.get("atpPlanId") or today_workout.get("atpPlanId")
+        goal_events = (
+            (await self._safe_call(self.get_calendar_events_for_plan, plan_id) or [])
+            if plan_id
+            else []
+        )
+        goal_event = _trim_goal_event(goal_events[0]) if goal_events else {}
+
         return {
             "lastActivities": trimmed_activities,
             "lastActivity": trimmed_last_activity,
@@ -2660,6 +2699,7 @@ class GarminClient:
             "scheduledWorkouts": scheduled_workouts,
             "todayScheduledWorkout": today_workout,
             "nextScheduledWorkout": next_workout,
+            "trainingPlanGoalEvent": goal_event,
         }
 
     async def fetch_training_data(
