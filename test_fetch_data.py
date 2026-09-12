@@ -17,7 +17,8 @@ from pathlib import Path
 from pprint import pprint
 
 logging.basicConfig(level=logging.INFO)
-from ha_garmin import GarminAuth, GarminClient  # noqa: E402
+from ha_garmin import GarminAuth, GarminAuthError, GarminClient  # noqa: E402
+from ha_garmin.exceptions import GarminMFARequired  # noqa: E402
 
 # === CREDENTIALS ===
 # Set these via environment variables or edit directly
@@ -60,6 +61,32 @@ def print_section(title: str, data: dict | list | None):
         pprint(data)
 
 
+def interactive_login(auth: GarminAuth) -> None:
+    """Prompt for credentials (and MFA if required) and log in."""
+    email = EMAIL
+    password = PASSWORD
+
+    if email == "your-email@example.com":
+        email = input("Garmin Email: ").strip()
+    if password == "your-password":
+        import getpass
+
+        password = getpass.getpass("Garmin Password: ")
+
+    print(f"Logging in as {email}...")
+
+    try:
+        auth.login(email, password)
+    except GarminMFARequired:
+        print("MFA required!")
+        mfa_code = input("Enter MFA code: ").strip()
+        auth.complete_mfa(mfa_code)
+
+    print("Login successful!")
+    auth.save_session(TOKEN_FILE)
+    print(f"Saved persistent auth state to {TOKEN_FILE}")
+
+
 async def main():
     """Fetch and display all data from ha_garmin."""
     # Initialize new engine
@@ -69,33 +96,11 @@ async def main():
         print(f"Successfully loaded seamless JWT session from {TOKEN_FILE}")
     else:
         print("No valid session found, initiating native login...")
-        email = EMAIL
-        password = PASSWORD
-
-        if email == "your-email@example.com":
-            email = input("Garmin Email: ").strip()
-        if password == "your-password":
-            import getpass
-
-            password = getpass.getpass("Garmin Password: ")
-
-        print(f"Logging in as {email}...")
-
         try:
-            from ha_garmin.exceptions import GarminMFARequired
-
-            auth.login(email, password)
-        except GarminMFARequired:
-            print("MFA required!")
-            mfa_code = input("Enter MFA code: ").strip()
-            auth.complete_mfa(mfa_code)
+            interactive_login(auth)
         except Exception as e:
             print(f"Login failed: {e}")
             return
-
-        print("Seamless Login successful!")
-        auth.save_session(TOKEN_FILE)
-        print(f"Saved persistent auth state to {TOKEN_FILE}")
 
     client = GarminClient(auth)
 
@@ -105,7 +110,24 @@ async def main():
     print("\n" + "=" * 60)
     print("  FETCHING USER PROFILE")
     print("=" * 60)
-    profile = await client.get_user_profile()
+    try:
+        profile = await client.get_user_profile()
+    except GarminAuthError:
+        # The loaded session looked valid locally (unexpired per its own
+        # stored timestamps) but Garmin rejected the refresh -- the refresh
+        # token itself has expired or been revoked server-side. Fall back
+        # to the same interactive login used for "no session on disk".
+        print(
+            "Stored session was rejected by Garmin (expired/revoked refresh "
+            "token). Re-authenticating..."
+        )
+        TOKEN_FILE.unlink(missing_ok=True)
+        try:
+            interactive_login(auth)
+        except Exception as e:
+            print(f"Login failed: {e}")
+            return
+        profile = await client.get_user_profile()
     print(f"  id: {profile.id}")
     print(f"  profile_id: {profile.profile_id}")
     print(f"  display_name: {profile.display_name}")
