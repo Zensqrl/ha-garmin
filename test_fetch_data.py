@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from pprint import pprint
 
@@ -187,11 +187,14 @@ async def main():
         next_month_scheduled_workouts_data,
     )
 
-    # === FETCH TRAINING PLAN DATA (investigating #521's fuller look-ahead) ===
+    # === FETCH TRAINING PLAN DATA (#521's training-plan detail) ===
     # calendar-service only shows what Garmin has already committed to the
-    # calendar, which can lag well behind what an adaptive (Coach) plan
-    # itself already has laid out for the week. Exploratory: not yet parsed
-    # anywhere, response shape unverified.
+    # calendar. The plan's own goal event (target race, projected time)
+    # lives at get_calendar_events_for_plan instead. The weekly day-marker
+    # look-ahead ("browse to next week" in the app) needs atp-api, a
+    # different gateway wanting session-cookie + CSRF auth this client
+    # can't currently produce -- tried and reverted, see git history on
+    # this file if picking it back up.
     print("\n" + "=" * 60)
     print("  FETCHING TRAINING PLANS")
     print("=" * 60)
@@ -201,7 +204,6 @@ async def main():
     atp_plan_id = (activity_data.get("nextScheduledWorkout") or {}).get("atpPlanId")
     adaptive_plan_data = None
     calendar_events_data = None
-    adaptive_plan_calendar_data = None
     if atp_plan_id:
         print("\n" + "=" * 60)
         print(f"  FETCHING ADAPTIVE TRAINING PLAN ({atp_plan_id})")
@@ -214,21 +216,6 @@ async def main():
         print("=" * 60)
         calendar_events_data = await client.get_calendar_events_for_plan(atp_plan_id)
         print_section(f"Calendar Events ({atp_plan_id})", calendar_events_data)
-
-        # This week (Mon-Sun) plus next, so it lines up with what "browse to
-        # next week" in the Garmin Connect web app actually shows.
-        week_start = today - timedelta(days=today.weekday())
-        week_end = week_start + timedelta(days=14)
-        print("\n" + "=" * 60)
-        print(f"  FETCHING ADAPTIVE PLAN CALENDAR ({week_start} to {week_end})")
-        print("=" * 60)
-        adaptive_plan_calendar_data = await client.get_adaptive_plan_calendar(
-            atp_plan_id, week_start, week_end
-        )
-        print_section(
-            f"Adaptive Plan Calendar ({week_start} to {week_end})",
-            adaptive_plan_calendar_data,
-        )
     else:
         print(
             "\n  (No atpPlanId on nextScheduledWorkout -- skipping adaptive plan fetches)"
@@ -311,7 +298,6 @@ async def main():
         "training_plans": training_plans_data,
         "adaptive_training_plan": adaptive_plan_data,
         "calendar_events_for_plan": calendar_events_data,
-        "adaptive_plan_calendar": adaptive_plan_calendar_data,
     }
 
     for section, data in all_data.items():

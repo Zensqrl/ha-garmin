@@ -21,11 +21,11 @@ TRAINING_PLANS_URL = f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/pl
 ADAPTIVE_TRAINING_PLAN_URL = (
     f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/fbt-adaptive"
 )
-# Different API gateway (atp-api, not gc-api) from everything else here --
-# discovered from the Garmin Connect web app's own network calls, not
-# documented anywhere. Unverified whether the existing DI-token auth
-# authenticates against it the same way as gc-api.
-ATP_ATHLETE_CALENDAR_URL = f"{GARMIN_CONNECT}/atp-api/atp/athlete/calendar"
+# atp-api/atp/athlete/calendar (a different API gateway, not gc-api) would
+# give the weekly workout day-markers, but wants session cookies + a CSRF
+# token this client can't currently produce -- tried and reverted
+# (home-assistant-garmin_connect#521). Not defined here for that reason;
+# see git history on this file if picking it back up.
 
 # Wellness endpoints
 HRV_URL = f"{GARMIN_CONNECT_API}/hrv-service/hrv"
