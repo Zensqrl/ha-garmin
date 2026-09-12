@@ -16,6 +16,16 @@ ACTIVITIES_BY_DATE_URL = f"{GARMIN_CONNECT_API}/activitylist-service/activities/
 ACTIVITY_DETAILS_URL = f"{GARMIN_CONNECT_API}/activity-service/activity"
 WORKOUTS_URL = f"{GARMIN_CONNECT_API}/workout-service/workouts"
 CALENDAR_URL = f"{GARMIN_CONNECT_API}/calendar-service/year"
+CALENDAR_EVENTS_URL = f"{GARMIN_CONNECT_API}/calendar-service/events"
+TRAINING_PLANS_URL = f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/plans"
+ADAPTIVE_TRAINING_PLAN_URL = (
+    f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/fbt-adaptive"
+)
+# Different API gateway (atp-api, not gc-api) from everything else here --
+# discovered from the Garmin Connect web app's own network calls, not
+# documented anywhere. Unverified whether the existing DI-token auth
+# authenticates against it the same way as gc-api.
+ATP_ATHLETE_CALENDAR_URL = f"{GARMIN_CONNECT}/atp-api/atp/athlete/calendar"
 
 # Wellness endpoints
 HRV_URL = f"{GARMIN_CONNECT_API}/hrv-service/hrv"

@@ -15,10 +15,13 @@ from .const import (
     ACTIVITY_DETAILS_URL,
     ACTIVITY_DOWNLOAD_URL,
     ACTIVITY_EXPORT_URL,
+    ADAPTIVE_TRAINING_PLAN_URL,
+    ATP_ATHLETE_CALENDAR_URL,
     BADGES_URL,
     BLOOD_PRESSURE_SET_URL,
     BLOOD_PRESSURE_URL,
     BODY_COMPOSITION_URL,
+    CALENDAR_EVENTS_URL,
     CALENDAR_URL,
     DAILY_STEPS_URL,
     DEFAULT_HEADERS,
@@ -46,6 +49,7 @@ from .const import (
     POWER_TO_WEIGHT_URL,
     SENSORS_URL,
     SLEEP_URL,
+    TRAINING_PLANS_URL,
     TRAINING_READINESS_URL,
     TRAINING_STATUS_URL,
     UPLOAD_URL,
@@ -1269,8 +1273,12 @@ class GarminClient:
         get_workouts only has the workout library, never when (or whether)
         something is scheduled.
 
-        Response shape is not verified against a real Coach plan yet, so
-        callers should treat the result as opaque until confirmed.
+        Confirmed against a real Coach plan: Garmin only "commits" a day's
+        session onto this calendar shortly before it happens -- a plan's
+        later sessions this same week can be entirely absent here even
+        though the Garmin Connect app already shows them (it reads the
+        adaptive plan's own detail for that). See
+        get_adaptive_training_plan_by_id for the fuller look-ahead.
         """
         _validate_positive_int(year, "year")
         if not 1 <= month <= 12:
@@ -1279,6 +1287,72 @@ class GarminClient:
         url = f"{CALENDAR_URL}/{year}/month/{month - 1}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
+
+    async def get_training_plans(self) -> Any:
+        """Get the user's training plans (e.g. an active Garmin Coach plan).
+
+        Response shape is not verified against a real account yet --
+        exploratory, for home-assistant-garmin_connect#521.
+        """
+        return await self._request("GET", TRAINING_PLANS_URL)
+
+    async def get_adaptive_training_plan_by_id(self, plan_id: int) -> dict[str, Any]:
+        """Get an adaptive (Garmin Coach) training plan's own detail.
+
+        Ported from python-garminconnect; response shape not verified
+        against a real account. Superseded in priority by
+        get_adaptive_plan_calendar and get_calendar_events_for_plan below,
+        both confirmed directly from the Garmin Connect web app's own
+        network calls -- kept in case it turns out to carry something
+        those don't (home-assistant-garmin_connect#521).
+        """
+        _validate_positive_int(plan_id, "plan_id")
+        url = f"{ADAPTIVE_TRAINING_PLAN_URL}/{plan_id}"
+        data = await self._request("GET", url)
+        return data if isinstance(data, dict) else {}
+
+    async def get_calendar_events_for_plan(
+        self, training_plan_id: int
+    ) -> list[dict[str, Any]]:
+        """Get a training plan's goal event (target race, projected time).
+
+        Confirmed via the Garmin Connect web app's own network calls
+        (home-assistant-garmin_connect#521): returns the plan's own goal
+        event -- event name, target distance, target date,
+        projected/predicted race time -- not the weekly workout schedule
+        (see get_adaptive_plan_calendar for that).
+        """
+        _validate_positive_int(training_plan_id, "training_plan_id")
+        params = {"trainingPlanId": training_plan_id}
+        data = await self._request("GET", CALENDAR_EVENTS_URL, params=params)
+        return data if isinstance(data, list) else []
+
+    async def get_adaptive_plan_calendar(
+        self, plan_id: int, start_date: date, end_date: date
+    ) -> list[dict[str, Any]]:
+        """Get an adaptive plan's day markers for a date range.
+
+        Confirmed via the Garmin Connect web app's own network calls
+        (home-assistant-garmin_connect#521) -- this is what "browse to next
+        week" actually reads from. Returns one marker per training day in
+        range: {"scheduledWorkoutDate": ..., "workoutId": ..., ...} --
+        workoutId is null until Garmin assigns that day's actual content
+        closer to the date; get_scheduled_workouts only shows days that
+        already have it assigned.
+
+        Lives under a different API gateway (atp-api, not gc-api) than
+        everything else in this client -- unverified whether the existing
+        DI-token auth authenticates against it the same way.
+        """
+        _validate_positive_int(plan_id, "plan_id")
+        params = {
+            "athletePlanId": plan_id,
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "lang": "en",
+        }
+        data = await self._request("GET", ATP_ATHLETE_CALENDAR_URL, params=params)
+        return data if isinstance(data, list) else []
 
     async def get_hydration_data(
         self, target_date: date | None = None
