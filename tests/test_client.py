@@ -38,34 +38,6 @@ class TestGarminClient:
         with pytest.raises(GarminAuthError, match="Not authenticated"):
             await client.get_user_profile()
 
-    def test_get_url_rewrites_any_connect_garmin_gateway(self):
-        """Every gateway under connect.garmin.com must route through the
-        connectapi bypass, not just /gc-api -- other gateways (e.g.
-        atp-api) 403 when hit directly (home-assistant-garmin_connect#521).
-        """
-        auth = _make_auth()
-        client = GarminClient(auth)
-
-        assert (
-            client._get_url(
-                "https://connect.garmin.com/gc-api/userprofile-service/socialProfile"
-            )
-            == "https://connectapi.garmin.com/gc-api/userprofile-service/socialProfile"
-        )
-        assert (
-            client._get_url("https://connect.garmin.com/atp-api/atp/athlete/calendar")
-            == "https://connectapi.garmin.com/atp-api/atp/athlete/calendar"
-        )
-
-    def test_get_url_uses_cn_domain(self):
-        auth = _make_auth()
-        client = GarminClient(auth, is_cn=True)
-
-        assert (
-            client._get_url("https://connect.garmin.com/atp-api/atp/athlete/calendar")
-            == "https://connectapi.garmin.cn/atp-api/atp/athlete/calendar"
-        )
-
     async def test_get_user_profile(self):
         """Test get_user_profile parses response correctly."""
         auth = _make_auth()
@@ -177,39 +149,6 @@ class TestGarminClient:
             "GET", CALENDAR_EVENTS_URL, params={"trainingPlanId": 1789148356}
         )
 
-    async def test_get_adaptive_plan_calendar_passes_date_range(self):
-        from ha_garmin.const import ATP_ATHLETE_CALENDAR_URL
-
-        auth = _make_auth()
-        client = GarminClient(auth)
-
-        payload = [{"scheduledWorkoutDate": "2026-09-14", "workoutId": None}]
-        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = payload
-            result = await client.get_adaptive_plan_calendar(
-                1789148356, date(2026, 9, 14), date(2026, 9, 20)
-            )
-
-        assert result == payload
-        mock_req.assert_awaited_once_with(
-            "GET",
-            ATP_ATHLETE_CALENDAR_URL,
-            params={
-                "athletePlanId": 1789148356,
-                "startDate": "2026-09-14",
-                "endDate": "2026-09-20",
-                "lang": "en",
-            },
-        )
-
-    async def test_get_adaptive_plan_calendar_rejects_non_positive(self):
-        auth = _make_auth()
-        client = GarminClient(auth)
-        with pytest.raises(ValueError):
-            await client.get_adaptive_plan_calendar(
-                0, date(2026, 9, 14), date(2026, 9, 20)
-            )
-
     async def test_fetch_activity_data_includes_scheduled_workouts(self):
         """fetch_activity_data surfaces workout-type calendar items only,
         across this month and next (home-assistant-garmin_connect#521).
@@ -257,6 +196,21 @@ class TestGarminClient:
                 return next_month_payload
             raise AssertionError(f"unexpected month requested: {year}-{month}")
 
+        goal_event_payload = [
+            {
+                "eventName": "5K Plan",
+                "date": "2026-11-21",
+                "eventType": "running",
+                "completionTarget": {"value": 5.0, "unit": "kilometer"},
+                "eventCustomization": {
+                    "trainingPlanType": "COACH_ATP",
+                    "projectedRaceTimeDurationSeconds": 1829,
+                    "predictedRaceTimeDurationSeconds": 2101,
+                    "enrollmentTime": "2026-09-11T12:39:16.350",
+                },
+            }
+        ]
+
         with (
             patch.object(client, "get_activities", new_callable=AsyncMock) as mock_acts,
             patch.object(
@@ -270,10 +224,14 @@ class TestGarminClient:
                 "get_scheduled_workouts",
                 side_effect=fake_get_scheduled_workouts,
             ) as mock_calendar,
+            patch.object(
+                client, "get_calendar_events_for_plan", new_callable=AsyncMock
+            ) as mock_goal,
         ):
             mock_acts.return_value = []
             mock_workouts.return_value = []
             mock_hr.return_value = []
+            mock_goal.return_value = goal_event_payload
             data = await client.fetch_activity_data()
 
         assert mock_calendar.await_count == 2
@@ -282,6 +240,13 @@ class TestGarminClient:
         assert data["todayScheduledWorkout"]["title"] == "Benchmark Run"
         assert data["nextScheduledWorkout"]["title"] == "Benchmark Run"
         assert data["nextScheduledWorkout"]["atpPlanId"] == 222
+
+        mock_goal.assert_awaited_once_with(222)
+        assert data["trainingPlanGoalEvent"]["eventName"] == "5K Plan"
+        assert data["trainingPlanGoalEvent"]["targetDistance"] == 5.0
+        assert data["trainingPlanGoalEvent"]["targetDistanceUnit"] == "kilometer"
+        assert data["trainingPlanGoalEvent"]["trainingPlanType"] == "COACH_ATP"
+        assert data["trainingPlanGoalEvent"]["projectedRaceTimeDurationSeconds"] == 1829
 
     async def test_fetch_activity_data_uses_recency_not_window(self):
         """Test fetch_activity_data returns lastActivity even for old activities (#519)."""

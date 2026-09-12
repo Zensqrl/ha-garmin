@@ -16,7 +16,6 @@ from .const import (
     ACTIVITY_DOWNLOAD_URL,
     ACTIVITY_EXPORT_URL,
     ADAPTIVE_TRAINING_PLAN_URL,
-    ATP_ATHLETE_CALENDAR_URL,
     BADGES_URL,
     BLOOD_PRESSURE_SET_URL,
     BLOOD_PRESSURE_URL,
@@ -31,7 +30,6 @@ from .const import (
     ENDURANCE_SCORE_URL,
     FITNESS_AGE_URL,
     GARMIN_CN_CONNECT_API,
-    GARMIN_CONNECT,
     GARMIN_CONNECT_API,
     GEAR_DEFAULTS_URL,
     GEAR_LINK_URL,
@@ -387,6 +385,31 @@ CALENDAR_WORKOUT_ESSENTIAL_KEYS = {
 def _trim_calendar_workout_item(item: dict[str, Any]) -> dict[str, Any]:
     """Trim a calendarItems "workout" entry to the fields that matter."""
     return {k: v for k, v in item.items() if k in CALENDAR_WORKOUT_ESSENTIAL_KEYS}
+
+
+def _trim_goal_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Trim a training plan's goal event to the fields that matter.
+
+    Target/projection fields live nested under eventCustomization; flattened
+    here so callers don't have to know that.
+    """
+    customization = event.get("eventCustomization") or {}
+    target = event.get("completionTarget") or {}
+    return {
+        "eventName": event.get("eventName"),
+        "date": event.get("date"),
+        "eventType": event.get("eventType"),
+        "targetDistance": target.get("value"),
+        "targetDistanceUnit": target.get("unit"),
+        "trainingPlanType": customization.get("trainingPlanType"),
+        "projectedRaceTimeDurationSeconds": customization.get(
+            "projectedRaceTimeDurationSeconds"
+        ),
+        "predictedRaceTimeDurationSeconds": customization.get(
+            "predictedRaceTimeDurationSeconds"
+        ),
+        "enrollmentTime": customization.get("enrollmentTime"),
+    }
 
 
 def _seconds_to_minutes(seconds: int | float | None) -> int | None:
@@ -767,15 +790,9 @@ class GarminClient:
         self._ebike_fields_lock = asyncio.Lock()
 
     def _get_url(self, url: str) -> str:
-        """Resolve URL to correct connectapi domain.
-
-        Matches the bare connect.garmin.com root, not just the /gc-api
-        prefix: other API gateways under the same root (e.g. atp-api) get
-        403'd when hit directly, and need the same connectapi bypass
-        (home-assistant-garmin_connect#521).
-        """
+        """Resolve URL to correct connectapi domain."""
         domain = "garmin.cn" if self._is_cn else "garmin.com"
-        return url.replace(GARMIN_CONNECT, f"https://connectapi.{domain}")
+        return url.replace(GARMIN_CONNECT_API, f"https://connectapi.{domain}")
 
     async def _ensure_token_fresh(self) -> None:
         """Atomically check token expiry and refresh if needed.
@@ -1326,39 +1343,17 @@ class GarminClient:
         Confirmed via the Garmin Connect web app's own network calls
         (home-assistant-garmin_connect#521): returns the plan's own goal
         event -- event name, target distance, target date,
-        projected/predicted race time -- not the weekly workout schedule
-        (see get_adaptive_plan_calendar for that).
+        projected/predicted race time. Not the weekly workout schedule --
+        that lives behind atp-api/atp/athlete/calendar, a different API
+        gateway this client can't currently authenticate against (it
+        wants session cookies + a CSRF token, not the DI Bearer token
+        this client uses everywhere else). Tried and reverted; revisit if
+        a reason to support cookie-based auth turns up for something
+        else too.
         """
         _validate_positive_int(training_plan_id, "training_plan_id")
         params = {"trainingPlanId": training_plan_id}
         data = await self._request("GET", CALENDAR_EVENTS_URL, params=params)
-        return data if isinstance(data, list) else []
-
-    async def get_adaptive_plan_calendar(
-        self, plan_id: int, start_date: date, end_date: date
-    ) -> list[dict[str, Any]]:
-        """Get an adaptive plan's day markers for a date range.
-
-        Confirmed via the Garmin Connect web app's own network calls
-        (home-assistant-garmin_connect#521) -- this is what "browse to next
-        week" actually reads from. Returns one marker per training day in
-        range: {"scheduledWorkoutDate": ..., "workoutId": ..., ...} --
-        workoutId is null until Garmin assigns that day's actual content
-        closer to the date; get_scheduled_workouts only shows days that
-        already have it assigned.
-
-        Lives under a different API gateway (atp-api, not gc-api) than
-        everything else in this client -- unverified whether the existing
-        DI-token auth authenticates against it the same way.
-        """
-        _validate_positive_int(plan_id, "plan_id")
-        params = {
-            "athletePlanId": plan_id,
-            "startDate": start_date.isoformat(),
-            "endDate": end_date.isoformat(),
-            "lang": "en",
-        }
-        data = await self._request("GET", ATP_ATHLETE_CALENDAR_URL, params=params)
         return data if isinstance(data, list) else []
 
     async def get_hydration_data(
@@ -2592,7 +2587,9 @@ class GarminClient:
         API calls: get_activities, get_activity_details,
                    get_activity_hr_in_timezones, get_workouts,
                    get_scheduled_workouts x2 (this + next month) (6 calls),
-                   plus get_activity for rides (e-bike fields, #527)
+                   plus get_activity for rides (e-bike fields, #527), plus
+                   get_calendar_events_for_plan when a scheduled workout
+                   carries an atpPlanId
 
         target_date is kept for signature compatibility; activities are
         fetched by recency (newest _RECENT_ACTIVITIES_LIMIT), not by date.
@@ -2682,6 +2679,18 @@ class GarminClient:
         )
         next_workout = scheduled_workouts[0] if scheduled_workouts else {}
 
+        # The plan's own goal event (target race, distance, projected time).
+        # atpPlanId (not the workout item's own trainingPlanId field, which
+        # has been observed as a stale 0) is the id calendar-service/events
+        # actually wants.
+        plan_id = next_workout.get("atpPlanId") or today_workout.get("atpPlanId")
+        goal_events = (
+            (await self._safe_call(self.get_calendar_events_for_plan, plan_id) or [])
+            if plan_id
+            else []
+        )
+        goal_event = _trim_goal_event(goal_events[0]) if goal_events else {}
+
         return {
             "lastActivities": trimmed_activities,
             "lastActivity": trimmed_last_activity,
@@ -2690,6 +2699,7 @@ class GarminClient:
             "scheduledWorkouts": scheduled_workouts,
             "todayScheduledWorkout": today_workout,
             "nextScheduledWorkout": next_workout,
+            "trainingPlanGoalEvent": goal_event,
         }
 
     async def fetch_training_data(
