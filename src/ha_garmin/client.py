@@ -31,6 +31,7 @@ from .const import (
     ENDURANCE_SCORE_URL,
     FITNESS_AGE_URL,
     GARMIN_CN_CONNECT_API,
+    GARMIN_CONNECT,
     GARMIN_CONNECT_API,
     GEAR_DEFAULTS_URL,
     GEAR_LINK_URL,
@@ -766,9 +767,15 @@ class GarminClient:
         self._ebike_fields_lock = asyncio.Lock()
 
     def _get_url(self, url: str) -> str:
-        """Resolve URL to correct connectapi domain."""
+        """Resolve URL to correct connectapi domain.
+
+        Matches the bare connect.garmin.com root, not just the /gc-api
+        prefix: other API gateways under the same root (e.g. atp-api) get
+        403'd when hit directly, and need the same connectapi bypass
+        (home-assistant-garmin_connect#521).
+        """
         domain = "garmin.cn" if self._is_cn else "garmin.com"
-        return url.replace(GARMIN_CONNECT_API, f"https://connectapi.{domain}")
+        return url.replace(GARMIN_CONNECT, f"https://connectapi.{domain}")
 
     async def _ensure_token_fresh(self) -> None:
         """Atomically check token expiry and refresh if needed.

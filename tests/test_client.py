@@ -38,6 +38,34 @@ class TestGarminClient:
         with pytest.raises(GarminAuthError, match="Not authenticated"):
             await client.get_user_profile()
 
+    def test_get_url_rewrites_any_connect_garmin_gateway(self):
+        """Every gateway under connect.garmin.com must route through the
+        connectapi bypass, not just /gc-api -- other gateways (e.g.
+        atp-api) 403 when hit directly (home-assistant-garmin_connect#521).
+        """
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        assert (
+            client._get_url(
+                "https://connect.garmin.com/gc-api/userprofile-service/socialProfile"
+            )
+            == "https://connectapi.garmin.com/gc-api/userprofile-service/socialProfile"
+        )
+        assert (
+            client._get_url("https://connect.garmin.com/atp-api/atp/athlete/calendar")
+            == "https://connectapi.garmin.com/atp-api/atp/athlete/calendar"
+        )
+
+    def test_get_url_uses_cn_domain(self):
+        auth = _make_auth()
+        client = GarminClient(auth, is_cn=True)
+
+        assert (
+            client._get_url("https://connect.garmin.com/atp-api/atp/athlete/calendar")
+            == "https://connectapi.garmin.cn/atp-api/atp/athlete/calendar"
+        )
+
     async def test_get_user_profile(self):
         """Test get_user_profile parses response correctly."""
         auth = _make_auth()
