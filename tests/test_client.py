@@ -100,11 +100,51 @@ class TestGarminClient:
             await client.get_scheduled_workouts(2026, 0)
 
     async def test_fetch_activity_data_includes_scheduled_workouts(self):
-        """fetch_activity_data must surface the training calendar (home-assistant-garmin_connect#521)."""
+        """fetch_activity_data surfaces workout-type calendar items only,
+        across this month and next (home-assistant-garmin_connect#521).
+
+        Real calendarItems mix several unrelated event types under
+        `itemType` (weigh-ins, naps, workouts); only "workout" is a Coach /
+        adaptive-plan session or self-scheduled workout. Past items and
+        other item types must not leak through.
+        """
         auth = _make_auth()
         client = GarminClient(auth)
 
-        calendar_payload = {"calendarItems": [{"date": "2026-04-13"}]}
+        today = date.today()
+        yesterday = (today - timedelta(days=1)).isoformat()
+        today_str = today.isoformat()
+        next_month = today.month + 1 if today.month < 12 else 1
+        next_month_year = today.year if today.month < 12 else today.year + 1
+        next_month_date = date(next_month_year, next_month, 1).isoformat()
+
+        this_month_payload = {
+            "calendarItems": [
+                {"itemType": "workout", "date": yesterday, "title": "Old Run"},
+                {"itemType": "weight", "date": today_str, "weight": 80000.0},
+                {
+                    "itemType": "workout",
+                    "date": today_str,
+                    "title": "Benchmark Run",
+                    "sportTypeKey": "running",
+                    "workoutId": 111,
+                    "atpPlanId": 222,
+                    "protectedWorkoutSchedule": True,
+                },
+            ]
+        }
+        next_month_payload = {
+            "calendarItems": [
+                {"itemType": "workout", "date": next_month_date, "title": "Long Run"},
+            ]
+        }
+
+        async def fake_get_scheduled_workouts(year, month):
+            if (year, month) == (today.year, today.month):
+                return this_month_payload
+            if (year, month) == (next_month_year, next_month):
+                return next_month_payload
+            raise AssertionError(f"unexpected month requested: {year}-{month}")
 
         with (
             patch.object(client, "get_activities", new_callable=AsyncMock) as mock_acts,
@@ -115,17 +155,22 @@ class TestGarminClient:
                 client, "get_activity_hr_in_timezones", new_callable=AsyncMock
             ) as mock_hr,
             patch.object(
-                client, "get_scheduled_workouts", new_callable=AsyncMock
+                client,
+                "get_scheduled_workouts",
+                side_effect=fake_get_scheduled_workouts,
             ) as mock_calendar,
         ):
             mock_acts.return_value = []
             mock_workouts.return_value = []
             mock_hr.return_value = []
-            mock_calendar.return_value = calendar_payload
             data = await client.fetch_activity_data()
 
-        assert data["scheduledWorkouts"] == calendar_payload
-        mock_calendar.assert_awaited_once()
+        assert mock_calendar.await_count == 2
+        dates = [w["date"] for w in data["scheduledWorkouts"]]
+        assert dates == [today_str, next_month_date]
+        assert data["todayScheduledWorkout"]["title"] == "Benchmark Run"
+        assert data["nextScheduledWorkout"]["title"] == "Benchmark Run"
+        assert data["nextScheduledWorkout"]["atpPlanId"] == 222
 
     async def test_fetch_activity_data_uses_recency_not_window(self):
         """Test fetch_activity_data returns lastActivity even for old activities (#519)."""
