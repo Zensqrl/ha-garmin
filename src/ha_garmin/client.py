@@ -19,6 +19,7 @@ from .const import (
     BLOOD_PRESSURE_SET_URL,
     BLOOD_PRESSURE_URL,
     BODY_COMPOSITION_URL,
+    CALENDAR_URL,
     DAILY_STEPS_URL,
     DEFAULT_HEADERS,
     DEVICE_LAST_USED_URL,
@@ -1223,12 +1224,34 @@ class GarminClient:
     async def get_workouts(
         self, start: int = 0, limit: int = 10
     ) -> list[dict[str, Any]]:
-        """Get scheduled workouts."""
+        """Get the workout library (workouts created/saved, not when scheduled).
+
+        Use get_scheduled_workouts for the training calendar.
+        """
         params = {"start": start, "limit": limit}
         data = await self._request("GET", WORKOUTS_URL, params=params)
         if isinstance(data, dict):
             return data.get("workouts", [])
         return data if isinstance(data, list) else []
+
+    async def get_scheduled_workouts(self, year: int, month: int) -> dict[str, Any]:
+        """Get the training calendar for a given year and month (1-12).
+
+        Both self-scheduled workouts and Garmin Coach / adaptive training
+        plan sessions appear here (home-assistant-garmin_connect#521) --
+        get_workouts only has the workout library, never when (or whether)
+        something is scheduled.
+
+        Response shape is not verified against a real Coach plan yet, so
+        callers should treat the result as opaque until confirmed.
+        """
+        _validate_positive_int(year, "year")
+        if not 1 <= month <= 12:
+            raise ValueError(f"month must be between 1 and 12, got: {month}")
+        # Garmin's API is 0-indexed for month on this endpoint specifically.
+        url = f"{CALENDAR_URL}/{year}/month/{month - 1}"
+        data = await self._request("GET", url)
+        return data if isinstance(data, dict) else {}
 
     async def get_hydration_data(
         self, target_date: date | None = None
@@ -2459,8 +2482,9 @@ class GarminClient:
         """Fetch activity data: activities, polyline, HR zones, workouts.
 
         API calls: get_activities, get_activity_details,
-                   get_activity_hr_in_timezones, get_workouts (4 calls),
-                   plus get_activity for rides (e-bike fields, #527)
+                   get_activity_hr_in_timezones, get_workouts,
+                   get_scheduled_workouts (5 calls), plus get_activity for
+                   rides (e-bike fields, #527)
 
         target_date is kept for signature compatibility; activities are
         fetched by recency (newest _RECENT_ACTIVITIES_LIMIT), not by date.
@@ -2515,11 +2539,21 @@ class GarminClient:
         trimmed_activities = [_trim_activity(a) for a in (recent_activities or [])]
         trimmed_last_activity = _trim_activity(last_activity) if last_activity else {}
 
+        # Training calendar -- exposed raw (#521). Garmin Coach / adaptive
+        # plan sessions land here, but the response shape isn't verified
+        # against a real plan yet; not parsed until it is.
+        today = date.today()
+        scheduled_workouts = (
+            await self._safe_call(self.get_scheduled_workouts, today.year, today.month)
+            or {}
+        )
+
         return {
             "lastActivities": trimmed_activities,
             "lastActivity": trimmed_last_activity,
             "workouts": workouts,
             "lastWorkout": workouts[0] if workouts else {},
+            "scheduledWorkouts": scheduled_workouts,
         }
 
     async def fetch_training_data(
