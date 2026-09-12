@@ -2487,7 +2487,7 @@ class GarminClient:
                 # only has day-wide latest/lowest/highest, and a client-side
                 # average from those is unreliable since the read frequency
                 # backing them varies.
-                avg_sleep_respiration_value = daily_sleep.get("avgRespirationValue")
+                avg_sleep_respiration_value = daily_sleep.get("averageRespirationValue")
                 unmeasurable_sleep_seconds = daily_sleep.get("unmeasurableSleepSeconds")
                 sleep_need_data = daily_sleep.get("sleepNeed") or {}
                 next_sleep_need_data = daily_sleep.get("nextSleepNeed") or {}

@@ -859,7 +859,7 @@ class TestGarminClient:
                     "optimalSleepWindowEndMins": 20,
                 },
                 "sleepScores": {"overall": {"value": 85}},
-                "avgRespirationValue": 14.2,
+                "averageRespirationValue": 14.2,
             }
         }
 
