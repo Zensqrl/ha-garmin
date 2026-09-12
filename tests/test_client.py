@@ -99,6 +99,89 @@ class TestGarminClient:
         with pytest.raises(ValueError, match="month must be between 1 and 12"):
             await client.get_scheduled_workouts(2026, 0)
 
+    async def test_get_training_plans_hits_plans_url(self):
+        from ha_garmin.const import TRAINING_PLANS_URL
+
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = {"plans": []}
+            result = await client.get_training_plans()
+
+        assert result == {"plans": []}
+        mock_req.assert_awaited_once_with("GET", TRAINING_PLANS_URL)
+
+    async def test_get_adaptive_training_plan_by_id_builds_url(self):
+        from ha_garmin.const import ADAPTIVE_TRAINING_PLAN_URL
+
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = {"planId": 1789148356}
+            result = await client.get_adaptive_training_plan_by_id(1789148356)
+
+        assert result == {"planId": 1789148356}
+        mock_req.assert_awaited_once_with(
+            "GET", f"{ADAPTIVE_TRAINING_PLAN_URL}/1789148356"
+        )
+
+    async def test_get_adaptive_training_plan_by_id_rejects_non_positive(self):
+        auth = _make_auth()
+        client = GarminClient(auth)
+        with pytest.raises(ValueError):
+            await client.get_adaptive_training_plan_by_id(0)
+
+    async def test_get_calendar_events_for_plan_passes_training_plan_id(self):
+        from ha_garmin.const import CALENDAR_EVENTS_URL
+
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        payload = [{"id": 29937926, "eventName": "5K Plan"}]
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = payload
+            result = await client.get_calendar_events_for_plan(1789148356)
+
+        assert result == payload
+        mock_req.assert_awaited_once_with(
+            "GET", CALENDAR_EVENTS_URL, params={"trainingPlanId": 1789148356}
+        )
+
+    async def test_get_adaptive_plan_calendar_passes_date_range(self):
+        from ha_garmin.const import ATP_ATHLETE_CALENDAR_URL
+
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        payload = [{"scheduledWorkoutDate": "2026-09-14", "workoutId": None}]
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = payload
+            result = await client.get_adaptive_plan_calendar(
+                1789148356, date(2026, 9, 14), date(2026, 9, 20)
+            )
+
+        assert result == payload
+        mock_req.assert_awaited_once_with(
+            "GET",
+            ATP_ATHLETE_CALENDAR_URL,
+            params={
+                "athletePlanId": 1789148356,
+                "startDate": "2026-09-14",
+                "endDate": "2026-09-20",
+                "lang": "en",
+            },
+        )
+
+    async def test_get_adaptive_plan_calendar_rejects_non_positive(self):
+        auth = _make_auth()
+        client = GarminClient(auth)
+        with pytest.raises(ValueError):
+            await client.get_adaptive_plan_calendar(
+                0, date(2026, 9, 14), date(2026, 9, 20)
+            )
+
     async def test_fetch_activity_data_includes_scheduled_workouts(self):
         """fetch_activity_data surfaces workout-type calendar items only,
         across this month and next (home-assistant-garmin_connect#521).
