@@ -357,6 +357,33 @@ def _trim_activity(activity: dict[str, Any]) -> dict[str, Any]:
     return _convert_datetime_fields(trimmed)
 
 
+# calendar-service's calendarItems mixes several unrelated event types under
+# `itemType` (observed: "weight" weigh-ins, "nap" sleep entries, "workout"
+# scheduled sessions) in one flat ~70-field-per-item shape, most of them
+# null for any given item type. Only "workout" items are Garmin Coach /
+# adaptive-plan sessions or self-scheduled workouts (#521); these are the
+# fields relevant to that one item type.
+CALENDAR_WORKOUT_ESSENTIAL_KEYS = {
+    "id",
+    "date",
+    "title",
+    "sportTypeKey",
+    "workoutId",
+    "atpPlanId",
+    "trainingPlanId",
+    "protectedWorkoutSchedule",
+    "phasedTrainingPlan",
+    "duration",
+    "distance",
+    "calories",
+}
+
+
+def _trim_calendar_workout_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Trim a calendarItems "workout" entry to the fields that matter."""
+    return {k: v for k, v in item.items() if k in CALENDAR_WORKOUT_ESSENTIAL_KEYS}
+
+
 def _seconds_to_minutes(seconds: int | float | None) -> int | None:
     """Convert seconds to minutes, rounded to nearest integer."""
     if seconds is None:
@@ -2483,8 +2510,8 @@ class GarminClient:
 
         API calls: get_activities, get_activity_details,
                    get_activity_hr_in_timezones, get_workouts,
-                   get_scheduled_workouts (5 calls), plus get_activity for
-                   rides (e-bike fields, #527)
+                   get_scheduled_workouts x2 (this + next month) (6 calls),
+                   plus get_activity for rides (e-bike fields, #527)
 
         target_date is kept for signature compatibility; activities are
         fetched by recency (newest _RECENT_ACTIVITIES_LIMIT), not by date.
@@ -2539,14 +2566,40 @@ class GarminClient:
         trimmed_activities = [_trim_activity(a) for a in (recent_activities or [])]
         trimmed_last_activity = _trim_activity(last_activity) if last_activity else {}
 
-        # Training calendar -- exposed raw (#521). Garmin Coach / adaptive
-        # plan sessions land here, but the response shape isn't verified
-        # against a real plan yet; not parsed until it is.
+        # Training calendar: Garmin Coach / adaptive-plan sessions and
+        # self-scheduled workouts (#521). Fetches this month and next so a
+        # session right after a month boundary isn't missed.
         today = date.today()
-        scheduled_workouts = (
+        next_month = today.month + 1 if today.month < 12 else 1
+        next_month_year = today.year if today.month < 12 else today.year + 1
+        calendar_this_month = (
             await self._safe_call(self.get_scheduled_workouts, today.year, today.month)
             or {}
         )
+        calendar_next_month = (
+            await self._safe_call(
+                self.get_scheduled_workouts, next_month_year, next_month
+            )
+            or {}
+        )
+        calendar_items = (calendar_this_month.get("calendarItems") or []) + (
+            calendar_next_month.get("calendarItems") or []
+        )
+
+        today_str = today.isoformat()
+        scheduled_workouts = sorted(
+            (
+                _trim_calendar_workout_item(item)
+                for item in calendar_items
+                if item.get("itemType") == "workout"
+                and (item.get("date") or "") >= today_str
+            ),
+            key=lambda w: w.get("date") or "",
+        )
+        today_workout = next(
+            (w for w in scheduled_workouts if w.get("date") == today_str), {}
+        )
+        next_workout = scheduled_workouts[0] if scheduled_workouts else {}
 
         return {
             "lastActivities": trimmed_activities,
@@ -2554,6 +2607,8 @@ class GarminClient:
             "workouts": workouts,
             "lastWorkout": workouts[0] if workouts else {},
             "scheduledWorkouts": scheduled_workouts,
+            "todayScheduledWorkout": today_workout,
+            "nextScheduledWorkout": next_workout,
         }
 
     async def fetch_training_data(

@@ -158,19 +158,23 @@ async def main():
                     print(f"    {k}: {v}")
 
     # === FETCH SCHEDULED WORKOUTS DATA (training calendar / Garmin Coach) ===
-    # activity_data["scheduledWorkouts"] already has the current month via
-    # fetch_activity_data; fetched again explicitly here (plus next month,
-    # for a plan whose next session lands after a month boundary) since the
-    # response shape isn't verified yet -- this is the easiest place to
-    # inspect it (home-assistant-garmin_connect#521).
+    # activity_data["todayScheduledWorkout"] / ["nextScheduledWorkout"] /
+    # ["scheduledWorkouts"] already have this filtered to workout-type
+    # items across this month + next, via fetch_activity_data
+    # (home-assistant-garmin_connect#521). Fetched again raw here too, for
+    # the full unfiltered calendar (weigh-ins, naps, etc. included).
+    print("\n  --- Today / Next Scheduled Workout ---")
+    print(f"    today: {activity_data.get('todayScheduledWorkout')}")
+    print(f"    next: {activity_data.get('nextScheduledWorkout')}")
+
     print("\n" + "=" * 60)
-    print("  FETCHING SCHEDULED WORKOUTS (training calendar)")
+    print("  FETCHING RAW CALENDAR (training calendar, unfiltered)")
     print("=" * 60)
     scheduled_workouts_data = await client.get_scheduled_workouts(
         today.year, today.month
     )
     print_section(
-        f"Scheduled Workouts ({today.year}-{today.month:02d})", scheduled_workouts_data
+        f"Raw Calendar ({today.year}-{today.month:02d})", scheduled_workouts_data
     )
 
     next_month = today.month + 1 if today.month < 12 else 1
@@ -179,7 +183,7 @@ async def main():
         next_month_year, next_month
     )
     print_section(
-        f"Scheduled Workouts ({next_month_year}-{next_month:02d})",
+        f"Raw Calendar ({next_month_year}-{next_month:02d})",
         next_month_scheduled_workouts_data,
     )
 
