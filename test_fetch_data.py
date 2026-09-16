@@ -17,7 +17,8 @@ from pathlib import Path
 from pprint import pprint
 
 logging.basicConfig(level=logging.INFO)
-from ha_garmin import GarminAuth, GarminClient  # noqa: E402
+from ha_garmin import GarminAuth, GarminAuthError, GarminClient  # noqa: E402
+from ha_garmin.exceptions import GarminMFARequired  # noqa: E402
 
 # === CREDENTIALS ===
 # Set these via environment variables or edit directly
@@ -60,6 +61,32 @@ def print_section(title: str, data: dict | list | None):
         pprint(data)
 
 
+def interactive_login(auth: GarminAuth) -> None:
+    """Prompt for credentials (and MFA if required) and log in."""
+    email = EMAIL
+    password = PASSWORD
+
+    if email == "your-email@example.com":
+        email = input("Garmin Email: ").strip()
+    if password == "your-password":
+        import getpass
+
+        password = getpass.getpass("Garmin Password: ")
+
+    print(f"Logging in as {email}...")
+
+    try:
+        auth.login(email, password)
+    except GarminMFARequired:
+        print("MFA required!")
+        mfa_code = input("Enter MFA code: ").strip()
+        auth.complete_mfa(mfa_code)
+
+    print("Login successful!")
+    auth.save_session(TOKEN_FILE)
+    print(f"Saved persistent auth state to {TOKEN_FILE}")
+
+
 async def main():
     """Fetch and display all data from ha_garmin."""
     # Initialize new engine
@@ -69,33 +96,11 @@ async def main():
         print(f"Successfully loaded seamless JWT session from {TOKEN_FILE}")
     else:
         print("No valid session found, initiating native login...")
-        email = EMAIL
-        password = PASSWORD
-
-        if email == "your-email@example.com":
-            email = input("Garmin Email: ").strip()
-        if password == "your-password":
-            import getpass
-
-            password = getpass.getpass("Garmin Password: ")
-
-        print(f"Logging in as {email}...")
-
         try:
-            from ha_garmin.exceptions import GarminMFARequired
-
-            auth.login(email, password)
-        except GarminMFARequired:
-            print("MFA required!")
-            mfa_code = input("Enter MFA code: ").strip()
-            auth.complete_mfa(mfa_code)
+            interactive_login(auth)
         except Exception as e:
             print(f"Login failed: {e}")
             return
-
-        print("Seamless Login successful!")
-        auth.save_session(TOKEN_FILE)
-        print(f"Saved persistent auth state to {TOKEN_FILE}")
 
     client = GarminClient(auth)
 
@@ -105,7 +110,24 @@ async def main():
     print("\n" + "=" * 60)
     print("  FETCHING USER PROFILE")
     print("=" * 60)
-    profile = await client.get_user_profile()
+    try:
+        profile = await client.get_user_profile()
+    except GarminAuthError:
+        # The loaded session looked valid locally (unexpired per its own
+        # stored timestamps) but Garmin rejected the refresh -- the refresh
+        # token itself has expired or been revoked server-side. Fall back
+        # to the same interactive login used for "no session on disk".
+        print(
+            "Stored session was rejected by Garmin (expired/revoked refresh "
+            "token). Re-authenticating..."
+        )
+        TOKEN_FILE.unlink(missing_ok=True)
+        try:
+            interactive_login(auth)
+        except Exception as e:
+            print(f"Login failed: {e}")
+            return
+        profile = await client.get_user_profile()
     print(f"  id: {profile.id}")
     print(f"  profile_id: {profile.profile_id}")
     print(f"  display_name: {profile.display_name}")
@@ -134,6 +156,70 @@ async def main():
                     print(f"    {k}: {v.isoformat()} ({type(v).__name__})")
                 elif k not in ("polyline", "hrTimeInZones"):
                     print(f"    {k}: {v}")
+
+    # === FETCH SCHEDULED WORKOUTS DATA (training calendar / Garmin Coach) ===
+    # activity_data["todayScheduledWorkout"] / ["nextScheduledWorkout"] /
+    # ["scheduledWorkouts"] already have this filtered to workout-type
+    # items across this month + next, via fetch_activity_data
+    # (home-assistant-garmin_connect#521). Fetched again raw here too, for
+    # the full unfiltered calendar (weigh-ins, naps, etc. included).
+    print("\n  --- Today / Next Scheduled Workout ---")
+    print(f"    today: {activity_data.get('todayScheduledWorkout')}")
+    print(f"    next: {activity_data.get('nextScheduledWorkout')}")
+
+    print("\n" + "=" * 60)
+    print("  FETCHING RAW CALENDAR (training calendar, unfiltered)")
+    print("=" * 60)
+    scheduled_workouts_data = await client.get_scheduled_workouts(
+        today.year, today.month
+    )
+    print_section(
+        f"Raw Calendar ({today.year}-{today.month:02d})", scheduled_workouts_data
+    )
+
+    next_month = today.month + 1 if today.month < 12 else 1
+    next_month_year = today.year if today.month < 12 else today.year + 1
+    next_month_scheduled_workouts_data = await client.get_scheduled_workouts(
+        next_month_year, next_month
+    )
+    print_section(
+        f"Raw Calendar ({next_month_year}-{next_month:02d})",
+        next_month_scheduled_workouts_data,
+    )
+
+    # === FETCH TRAINING PLAN DATA (#521's training-plan detail) ===
+    # calendar-service only shows what Garmin has already committed to the
+    # calendar. The plan's own goal event (target race, projected time)
+    # lives at get_calendar_events_for_plan instead. The weekly day-marker
+    # look-ahead ("browse to next week" in the app) needs atp-api, a
+    # different gateway wanting session-cookie + CSRF auth this client
+    # can't currently produce -- tried and reverted, see git history on
+    # this file if picking it back up.
+    print("\n" + "=" * 60)
+    print("  FETCHING TRAINING PLANS")
+    print("=" * 60)
+    training_plans_data = await client.get_training_plans()
+    print_section("Training Plans", training_plans_data)
+
+    atp_plan_id = (activity_data.get("nextScheduledWorkout") or {}).get("atpPlanId")
+    adaptive_plan_data = None
+    calendar_events_data = None
+    if atp_plan_id:
+        print("\n" + "=" * 60)
+        print(f"  FETCHING ADAPTIVE TRAINING PLAN ({atp_plan_id})")
+        print("=" * 60)
+        adaptive_plan_data = await client.get_adaptive_training_plan_by_id(atp_plan_id)
+        print_section(f"Adaptive Training Plan ({atp_plan_id})", adaptive_plan_data)
+
+        print("\n" + "=" * 60)
+        print(f"  FETCHING CALENDAR EVENTS FOR PLAN ({atp_plan_id})")
+        print("=" * 60)
+        calendar_events_data = await client.get_calendar_events_for_plan(atp_plan_id)
+        print_section(f"Calendar Events ({atp_plan_id})", calendar_events_data)
+    else:
+        print(
+            "\n  (No atpPlanId on nextScheduledWorkout -- skipping adaptive plan fetches)"
+        )
 
     # === FETCH TRAINING DATA ===
     print("\n" + "=" * 60)
@@ -207,6 +293,11 @@ async def main():
         "menstrual": menstrual_data,
         "nutrition": nutrition_data,
         "sensors": sensors_data,
+        "scheduled_workouts_this_month": scheduled_workouts_data,
+        "scheduled_workouts_next_month": next_month_scheduled_workouts_data,
+        "training_plans": training_plans_data,
+        "adaptive_training_plan": adaptive_plan_data,
+        "calendar_events_for_plan": calendar_events_data,
     }
 
     for section, data in all_data.items():

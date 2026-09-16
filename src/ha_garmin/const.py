@@ -15,6 +15,17 @@ ACTIVITIES_URL = (
 ACTIVITIES_BY_DATE_URL = f"{GARMIN_CONNECT_API}/activitylist-service/activities/byDate"
 ACTIVITY_DETAILS_URL = f"{GARMIN_CONNECT_API}/activity-service/activity"
 WORKOUTS_URL = f"{GARMIN_CONNECT_API}/workout-service/workouts"
+CALENDAR_URL = f"{GARMIN_CONNECT_API}/calendar-service/year"
+CALENDAR_EVENTS_URL = f"{GARMIN_CONNECT_API}/calendar-service/events"
+TRAINING_PLANS_URL = f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/plans"
+ADAPTIVE_TRAINING_PLAN_URL = (
+    f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/fbt-adaptive"
+)
+# atp-api/atp/athlete/calendar (a different API gateway, not gc-api) would
+# give the weekly workout day-markers, but wants session cookies + a CSRF
+# token this client can't currently produce -- tried and reverted
+# (home-assistant-garmin_connect#521). Not defined here for that reason;
+# see git history on this file if picking it back up.
 
 # Wellness endpoints
 HRV_URL = f"{GARMIN_CONNECT_API}/hrv-service/hrv"

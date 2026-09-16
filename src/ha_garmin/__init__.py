@@ -18,4 +18,4 @@ __all__ = [
     "GarminRateLimitError",
 ]
 
-__version__ = "0.1.37+zs1"
+__version__ = "0.1.47+zs1"

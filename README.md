@@ -55,7 +55,7 @@ async def fetch_all():
     today = date.today()
     core_data     = await client.fetch_core_data(today)      # Steps, HR, sleep, stress
     body_data     = await client.fetch_body_data(today)      # Weight, body composition, fitness age
-    activity_data = await client.fetch_activity_data(today)  # Activities, workouts
+    activity_data = await client.fetch_activity_data(today)  # Activities, workouts, training calendar
     training_data = await client.fetch_training_data(today)  # HRV, training status
     goals_data    = await client.fetch_goals_data()          # Goals, badges
     gear_data     = await client.fetch_gear_data()           # Gear, alarms, solar, devices
@@ -109,10 +109,10 @@ Optimized methods that group related API calls for Home Assistant coordinators:
 | ------ | --------- | ------------- |
 | `fetch_core_data()` | 4 | Steps, distance, calories, HR, stress, sleep, body battery, SPO2, intraday Body Battery + stress timelines |
 | `fetch_body_data()` | 3 | Weight, BMI, body fat, hydration, fitness age |
-| `fetch_activity_data()` | 4+ | Activities, workouts, HR zones, polylines |
+| `fetch_activity_data()` | 6+ | Activities, workouts, HR zones, polylines, training calendar (scheduled workouts) |
 | `fetch_training_data()` | 7 | Training readiness, status, HRV, lactate, endurance/hill scores |
 | `fetch_goals_data()` | 4 | Goals (active/future/history), badges, user level |
-| `fetch_gear_data()` | 6+ | Gear items, stats, device alarms, solar intensity, devices, last sync |
+| `fetch_gear_data()` | 6+ | Gear items, stats, device alarms, solar intensity (daily avg + gain), devices, last sync, paired sensors |
 | `fetch_blood_pressure_data()` | 1 | Blood pressure measurements |
 | `fetch_menstrual_data()` | 2 | Menstrual cycle data |
 | `fetch_nutrition_data()` | 1 | Nutrition log: consumed macros, goals, per-meal breakdown |
@@ -163,7 +163,8 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | `get_activity_details()` | Detailed activity with polyline |
 | `get_activity_hr_in_timezones()` | HR time in zones |
 | `download_activity(activity_id, file_format)` | Download activity file (fit/original/tcx/gpx/kml/csv) |
-| `get_workouts()` | Scheduled workouts |
+| `get_workouts()` | Workout library (created/saved workouts, not when scheduled) |
+| `get_scheduled_workouts(year, month)` | Training calendar for a month: self-scheduled + Garmin Coach / adaptive-plan workouts |
 | `get_training_readiness()` | Training readiness score |
 | `get_training_status()` | Training status |
 | `get_morning_training_readiness()` | Morning readiness |
