@@ -2576,10 +2576,10 @@ class GarminClient:
     # home-assistant-garmin_connect#567) derive a rolling-week count from this
     # list; fetching only 10 meant that count silently pinned at 10 forever
     # for anyone averaging 10+ activities a week, since the fetch itself, not
-    # the 7-day filter, was the actual ceiling. 25 is comfortably above what
-    # all but the most prolific multi-activity-per-day users would log in a
-    # week, while staying a single bounded list call.
-    _RECENT_ACTIVITIES_LIMIT = 25
+    # the 7-day filter, was the actual ceiling. Bumped 25 -> 50 (ha-garmin#30)
+    # for the same reason at the next tier up, while staying a single bounded
+    # list call.
+    _RECENT_ACTIVITIES_LIMIT = 50
 
     async def fetch_activity_data(
         self, target_date: date | None = None
