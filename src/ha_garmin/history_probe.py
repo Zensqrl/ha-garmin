@@ -66,7 +66,7 @@ def _descriptor_index(
     return fallback.index(wanted) if wanted in fallback else None
 
 
-def _epoch_ms(value: Any) -> int | None:
+def _epoch_ms(value: Any, *, assume_utc: bool = False) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int | float):
@@ -82,7 +82,9 @@ def _epoch_ms(value: Any) -> int | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        return None
+        if not assume_utc:
+            return None
+        parsed = parsed.replace(tzinfo=UTC)
     return int(parsed.timestamp() * 1000)
 
 
@@ -103,6 +105,11 @@ def _series_summary(
     points: list[tuple[int, float]] = []
     sentinel_rows = 0
     malformed_rows = 0
+    timestamp_rows = 0
+    numeric_value_rows = 0
+    null_value_rows = 0
+    other_value_rows = 0
+    row_widths: set[int] = set()
 
     if (
         isinstance(rows, list)
@@ -114,8 +121,17 @@ def _series_summary(
             if not isinstance(row, list | tuple) or len(row) <= required_index:
                 malformed_rows += 1
                 continue
+            row_widths.add(len(row))
             timestamp = _epoch_ms(row[timestamp_index])
             value = row[value_index]
+            if timestamp is not None:
+                timestamp_rows += 1
+            if value is None:
+                null_value_rows += 1
+            elif isinstance(value, int | float) and not isinstance(value, bool):
+                numeric_value_rows += 1
+            else:
+                other_value_rows += 1
             if (
                 timestamp is None
                 or isinstance(value, bool)
@@ -142,6 +158,11 @@ def _series_summary(
         "usable_samples": len(points),
         "sentinel_rows": sentinel_rows,
         "malformed_rows": malformed_rows,
+        "timestamp_rows": timestamp_rows,
+        "numeric_value_rows": numeric_value_rows,
+        "null_value_rows": null_value_rows,
+        "other_value_rows": other_value_rows,
+        "row_widths": sorted(row_widths),
         "first_sample_utc": _iso_utc(first),
         "last_sample_utc": _iso_utc(last),
         "span_hours": round((last - first) / 3_600_000, 3)
@@ -209,7 +230,7 @@ def summarize_body_battery_reports(
     }
 
 
-def summarize_steps(payload: Any) -> dict[str, Any]:
+def summarize_steps(payload: Any, daily_total: Any = None) -> dict[str, Any]:
     """Summarize dailySummaryChart rows without returning step values."""
     rows = (
         [item for item in payload if isinstance(item, dict)]
@@ -218,16 +239,27 @@ def summarize_steps(payload: Any) -> dict[str, Any]:
     )
     timestamps: list[int] = []
     rows_with_step_counts = 0
+    step_counts: list[float] = []
+    timestamp_field_counts = {
+        key: sum(row.get(key) is not None for row in rows)
+        for key in ("startGMT", "endGMT", "timestampGMT", "timestamp")
+    }
     for row in rows:
         if isinstance(row.get("steps"), int | float) and not isinstance(
             row.get("steps"), bool
         ):
             rows_with_step_counts += 1
+            step_counts.append(float(row["steps"]))
         timestamp = next(
             (
                 parsed
                 for key in ("startGMT", "endGMT", "timestampGMT", "timestamp")
-                if (parsed := _epoch_ms(row.get(key))) is not None
+                if (
+                    parsed := _epoch_ms(
+                        row.get(key), assume_utc=key.casefold().endswith("gmt")
+                    )
+                )
+                is not None
             ),
             None,
         )
@@ -240,10 +272,34 @@ def summarize_steps(payload: Any) -> dict[str, Any]:
         for earlier, later in pairwise(timestamps)
         if later > earlier
     ]
+    decreasing_transitions = sum(
+        later < earlier for earlier, later in pairwise(step_counts)
+    )
+    valid_daily_total = (
+        float(daily_total)
+        if isinstance(daily_total, int | float) and not isinstance(daily_total, bool)
+        else None
+    )
     return {
         "response_rows": len(rows),
         "rows_with_step_counts": rows_with_step_counts,
         "rows_with_utc_timestamps": len(timestamps),
+        "timestamp_field_counts": timestamp_field_counts,
+        "nonnegative_step_rows": sum(value >= 0 for value in step_counts),
+        "decreasing_step_transitions": decreasing_transitions,
+        "all_step_rows_non_decreasing": decreasing_transitions == 0
+        if len(step_counts) > 1
+        else None,
+        "daily_total_available": valid_daily_total is not None,
+        "sum_matches_daily_total": sum(step_counts) == valid_daily_total
+        if valid_daily_total is not None and step_counts
+        else None,
+        "last_matches_daily_total": step_counts[-1] == valid_daily_total
+        if valid_daily_total is not None and step_counts
+        else None,
+        "max_matches_daily_total": max(step_counts) == valid_daily_total
+        if valid_daily_total is not None and step_counts
+        else None,
         "first_sample_utc": _iso_utc(timestamps[0] if timestamps else None),
         "last_sample_utc": _iso_utc(timestamps[-1] if timestamps else None),
         "median_interval_seconds": round(statistics.median(intervals), 3)
@@ -274,20 +330,43 @@ async def _probe_date(client: GarminClient, target_date: date) -> dict[str, Any]
     calls: tuple[tuple[str, Callable[[date], Awaitable[Any]]], ...] = (
         ("daily_stress", client.get_daily_stress),
         ("body_battery_report", client.get_body_battery),
-        ("intraday_steps", client.get_steps_data),
     )
     for name, fetch in calls:
         try:
             payload = await fetch(target_date)
             if name == "daily_stress":
                 summary = summarize_daily_stress(payload, target_date)
-            elif name == "body_battery_report":
-                summary = summarize_body_battery_reports(payload, target_date)
             else:
-                summary = summarize_steps(payload)
+                summary = summarize_body_battery_reports(payload, target_date)
             result[name] = {"status": "ok", **summary}
         except Exception as error:
             result[name] = _error_category(error)
+
+    try:
+        steps_payload = await client.get_steps_data(target_date)
+        daily_total: Any = None
+        daily_total_lookup: dict[str, Any] = {"status": "ok", "date_present": False}
+        try:
+            daily_rows = await client.get_daily_steps(target_date, target_date)
+            matching_row = next(
+                (
+                    row
+                    for row in daily_rows
+                    if row.get("calendarDate") == target_date.isoformat()
+                ),
+                daily_rows[0] if len(daily_rows) == 1 else {},
+            )
+            daily_total = matching_row.get("totalSteps")
+            daily_total_lookup["date_present"] = bool(matching_row)
+        except Exception as error:
+            daily_total_lookup = _error_category(error)
+        result["intraday_steps"] = {
+            "status": "ok",
+            **summarize_steps(steps_payload, daily_total),
+            "daily_total_lookup": daily_total_lookup,
+        }
+    except Exception as error:
+        result["intraday_steps"] = _error_category(error)
     return result
 
 
