@@ -19,10 +19,13 @@ from .const import (
     BADGES_URL,
     BLOOD_PRESSURE_SET_URL,
     BLOOD_PRESSURE_URL,
+    BODY_BATTERY_URL,
     BODY_COMPOSITION_URL,
     CALENDAR_EVENTS_URL,
     CALENDAR_URL,
     DAILY_STEPS_URL,
+    DAILY_STRESS_URL,
+    DAILY_SUMMARY_CHART_URL,
     DEFAULT_HEADERS,
     DEVICE_LAST_USED_URL,
     DEVICE_SOLAR_URL,
@@ -1134,6 +1137,46 @@ class GarminClient:
         """Get daily steps for a date range."""
         url = f"{DAILY_STEPS_URL}/{start_date.isoformat()}/{end_date.isoformat()}"
         data = await self._request("GET", url)
+        return data if isinstance(data, list) else []
+
+    async def get_steps_data(
+        self, target_date: date | None = None
+    ) -> list[dict[str, Any]]:
+        """Get intraday step-chart rows for one calendar date."""
+        if target_date is None:
+            target_date = date.today()
+
+        profile = await self.get_user_profile()
+        url = f"{DAILY_SUMMARY_CHART_URL}/{quote(profile.display_name, safe='')}"
+        data = await self._request("GET", url, params={"date": target_date.isoformat()})
+        return data if isinstance(data, list) else []
+
+    async def get_daily_stress(self, target_date: date | None = None) -> dict[str, Any]:
+        """Get raw intraday stress and Body Battery data for one date."""
+        if target_date is None:
+            target_date = date.today()
+
+        url = f"{DAILY_STRESS_URL}/{target_date.isoformat()}"
+        data = await self._request("GET", url)
+        return data if isinstance(data, dict) else {}
+
+    async def get_body_battery(
+        self, start_date: date, end_date: date | None = None
+    ) -> list[dict[str, Any]]:
+        """Get Body Battery daily reports for an inclusive date range."""
+        if end_date is None:
+            end_date = start_date
+        if start_date > end_date:
+            raise ValueError("start_date cannot be after end_date")
+
+        data = await self._request(
+            "GET",
+            BODY_BATTERY_URL,
+            params={
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+            },
+        )
         return data if isinstance(data, list) else []
 
     async def get_body_composition(

@@ -87,6 +87,33 @@ async def fetch_all():
 asyncio.run(fetch_all())
 ```
 
+### Historical coverage probe
+
+Before designing storage for intraday history, the read-only probe can test
+which older dates Garmin still returns for stress, Body Battery, and intraday
+steps. It prints only coverage metadata: dates, sample counts, time ranges,
+sampling intervals, gaps, and sanitized error categories. Raw metric values,
+credentials, tokens, profile names, and account identifiers are never included.
+
+Use a private token-store path outside the repository. On the first run, set
+`GARMIN_EMAIL` if desired and enter the password at the hidden prompt. The
+`GARMIN_PASSWORD` environment variable is also supported for unattended use,
+but a prompt leaves the password in fewer places. Later runs reuse the saved
+session token.
+
+```bash
+GARMIN_EMAIL="you@example.com" \
+python -m ha_garmin.history_probe \
+  --token-store ~/.ha-garmin-history-probe \
+  --output garmin-history-coverage.json
+```
+
+The default sample dates include a seven-day block around 30 days ago plus
+isolated dates up to one year old. Use `--offsets 1,7,30,90` or
+`--dates 2026-01-01,2026-06-01` to choose another set. Add
+`--discard-session` to remove the locally cached token after the run. All API
+calls made by the probe are GET requests.
+
 ### Home Assistant integration
 
 Set up auth during `async_setup_entry` and pass the client to your coordinators.
