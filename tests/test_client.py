@@ -1176,12 +1176,8 @@ class TestGarminClient:
             {"sport": "RUNNING", "functionalThresholdPower": 425, "powerToWeight": 4.84}
         ]
 
-        async def mock_safe_call(func, *args, **kwargs):
-            if func == client.get_power_to_weight:
-                return ptw_payload
-            return {}
-
-        client._safe_call = mock_safe_call
+        client._request = AsyncMock(return_value={})
+        client.get_power_to_weight = AsyncMock(return_value=ptw_payload)
         data = await client.fetch_training_data()
 
         assert "powerToWeight" in data
@@ -1196,17 +1192,8 @@ class TestGarminClient:
             {"sport": "RUNNING", "functionalThresholdPower": 420, "powerToWeight": 4.78}
         ]
 
-        call_count = {"n": 0}
-
-        async def mock_safe_call(func, *args, **kwargs):
-            if func == client.get_power_to_weight:
-                call_count["n"] += 1
-                if call_count["n"] == 1:
-                    return []  # today: empty
-                return ptw_yesterday  # yesterday: has data
-            return {}
-
-        client._safe_call = mock_safe_call
+        client._request = AsyncMock(return_value={})
+        client.get_power_to_weight = AsyncMock(side_effect=[[], ptw_yesterday])
         data = await client.fetch_training_data()
 
         assert data["powerToWeight"] == ptw_yesterday

@@ -1,5 +1,28 @@
 # ha-garmin
 
+### Daily decision data and provenance
+
+`fetch_core_data(target_date=...)` and `fetch_training_data(target_date=...)`
+accept the consumer's local calendar date. Their existing fields remain available;
+the additive `_sources` mapping describes each endpoint's `ok`, `empty`, or `error`
+outcome, requested/query/source dates, UTC fetch time, and explicit fallback use.
+A query date is not evidence of the returned observation's date. Missing source
+dates remain `None`. Fetch times are not device measurement times. Authentication
+and rate-limit exceptions continue to propagate. Metadata contains no raw error
+messages or account identifiers.
+
+Training aggregates additionally expose `acuteTrainingLoad`, `chronicTrainingLoad`,
+`trainingLoadRatio`, and `trainingLoadRatioStatus`. They come from a single device:
+prefer the requested date, then the primary training device, then latest date and
+a stable tie-breaker. Source date and primary-device selection are exposed. Today's
+load is kept independently of the existing VO2-driven training-status fallback.
+The existing status/VO2 fields retain their previous selection behavior.
+
+`trainingLoadChronicMin`/`trainingLoadChronicMax` retain the source fields' names
+and must not be presented as confirmed acute/weekly optimal bounds. Null values
+remain unknown; acute load is not a sum of activity loads. This change adds no
+endpoint requests, history backfill, or nutrition behavior.
+
 Python client for Garmin Connect API, designed for Home Assistant integration.
 
 ## Features
