@@ -19,11 +19,13 @@ from .const import (
     BADGES_URL,
     BLOOD_PRESSURE_SET_URL,
     BLOOD_PRESSURE_URL,
+    BODY_BATTERY_URL,
     BODY_COMPOSITION_URL,
     CALENDAR_EVENTS_URL,
     CALENDAR_URL,
     DAILY_STEPS_URL,
     DAILY_STRESS_URL,
+    DAILY_SUMMARY_CHART_URL,
     DEFAULT_HEADERS,
     DEVICE_LAST_USED_URL,
     DEVICE_SOLAR_URL,
@@ -60,6 +62,7 @@ from .const import (
 )
 from .exceptions import GarminAPIError, GarminAuthError, GarminRateLimitError
 from .models import UserProfile
+from .provenance import FetchProvenance, normalize_training_load
 
 if TYPE_CHECKING:
     from .auth import GarminAuth
@@ -1253,6 +1256,37 @@ class GarminClient:
         """Get daily steps for a date range."""
         url = f"{DAILY_STEPS_URL}/{start_date.isoformat()}/{end_date.isoformat()}"
         data = await self._request("GET", url)
+        return data if isinstance(data, list) else []
+
+    async def get_steps_data(
+        self, target_date: date | None = None
+    ) -> list[dict[str, Any]]:
+        """Get intraday step-chart rows for one calendar date."""
+        if target_date is None:
+            target_date = date.today()
+
+        profile = await self.get_user_profile()
+        url = f"{DAILY_SUMMARY_CHART_URL}/{quote(profile.display_name, safe='')}"
+        data = await self._request("GET", url, params={"date": target_date.isoformat()})
+        return data if isinstance(data, list) else []
+
+    async def get_body_battery(
+        self, start_date: date, end_date: date | None = None
+    ) -> list[dict[str, Any]]:
+        """Get Body Battery daily reports for an inclusive date range."""
+        if end_date is None:
+            end_date = start_date
+        if start_date > end_date:
+            raise ValueError("start_date cannot be after end_date")
+
+        data = await self._request(
+            "GET",
+            BODY_BATTERY_URL,
+            params={
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+            },
+        )
         return data if isinstance(data, list) else []
 
     async def get_body_composition(
@@ -2547,30 +2581,29 @@ class GarminClient:
         # outage would silently overwrite all of today's data, including
         # fast-changing fields like body battery, with a full day-old
         # snapshot (cyberjunky/home-assistant-garmin_connect#536).
-        try:
-            summary_raw = await self._get_user_summary_raw(target_date)
-            today_fetch_failed = False
-        except GarminAPIError as err:
-            _LOGGER.warning("API call %s failed: %s", "_get_user_summary_raw", err)
-            summary_raw = None
-            today_fetch_failed = True
+        provenance = FetchProvenance(target_date)
+        summary_raw = await provenance.read(
+            "summary", self._get_user_summary_raw, target_date
+        )
+        today_fetch_failed = provenance.sources["summary"]["outcome"] == "error"
 
         today_data_not_ready = not today_fetch_failed and (
             not summary_raw or summary_raw.get("dailyStepGoal") is None
         )
 
         if today_data_not_ready:
-            yesterday_summary = await self._safe_call(
-                self._get_user_summary_raw, yesterday_date
+            yesterday_summary = await provenance.read(
+                "summaryFallback", self._get_user_summary_raw, yesterday_date
             )
             if yesterday_summary and yesterday_summary.get("dailyStepGoal") is not None:
                 summary_raw = yesterday_summary
+                provenance.select("summary", "summaryFallback")
 
         summary_raw = summary_raw or {}
 
         # Weekly averages
-        daily_steps = await self._safe_call(
-            self.get_daily_steps, week_ago, yesterday_date
+        daily_steps = await provenance.read(
+            "dailySteps", self.get_daily_steps, week_ago, yesterday_date
         )
         yesterday_steps = None
         yesterday_distance = None
@@ -2590,7 +2623,9 @@ class GarminClient:
                 weekly_distance_avg = round(total_distance / days_count)
 
         # Sleep data
-        sleep_data = await self._safe_call(self._get_sleep_data_raw, target_date)
+        sleep_data = await provenance.read(
+            "sleep", self._get_sleep_data_raw, target_date
+        )
         sleep_score = None
         sleep_time_seconds = None
         deep_sleep_seconds = None
@@ -2713,16 +2748,24 @@ class GarminClient:
             "optimalWakeTime": optimal_wake_time,
             "avgSleepRespirationValue": avg_sleep_respiration_value,
         }
-        return _add_computed_fields(data)
+        data["_sources"] = {
+            k: v for k, v in provenance.sources.items() if not k.endswith("Fallback")
+        }
+        result = _add_computed_fields(data)
+        # Device sync is distinct from both the HTTP fetch and measurement time.
+        last_sync = result.get("lastSyncTimestamp")
+        if isinstance(last_sync, datetime):
+            result["_sources"]["summary"]["last_sync_at"] = last_sync.isoformat()
+        return result
 
     # How many recent activities to pull for `lastActivities`. Consumers (e.g.
     # home-assistant-garmin_connect#567) derive a rolling-week count from this
     # list; fetching only 10 meant that count silently pinned at 10 forever
     # for anyone averaging 10+ activities a week, since the fetch itself, not
-    # the 7-day filter, was the actual ceiling. 25 is comfortably above what
-    # all but the most prolific multi-activity-per-day users would log in a
-    # week, while staying a single bounded list call.
-    _RECENT_ACTIVITIES_LIMIT = 25
+    # the 7-day filter, was the actual ceiling. Bumped 25 -> 50 (ha-garmin#30)
+    # for the same reason at the next tier up, while staying a single bounded
+    # list call.
+    _RECENT_ACTIVITIES_LIMIT = 50
 
     async def fetch_activity_data(
         self, target_date: date | None = None
@@ -2863,14 +2906,15 @@ class GarminClient:
             target_date = date.today()
 
         yesterday_date = target_date - timedelta(days=1)
+        provenance = FetchProvenance(target_date)
 
-        training_readiness = await self._safe_call(
-            self.get_training_readiness, target_date
+        training_readiness = await provenance.read(
+            "readiness", self.get_training_readiness, target_date
         )
-        morning_training_readiness = await self._safe_call(
-            self.get_morning_training_readiness, target_date
+        morning_training_readiness = await provenance.read(
+            "morningReadiness", self.get_morning_training_readiness, target_date
         )
-        lactate_threshold = await self._safe_call(self.get_lactate_threshold)
+        lactate_threshold = await provenance.read("lactate", self.get_lactate_threshold)
 
         # Training status — fall back to yesterday if today's is empty or has no VO2Max
         def _has_vo2max(ts: dict[str, Any] | None) -> bool:
@@ -2881,46 +2925,64 @@ class GarminClient:
                 )
             )
 
-        training_status = await self._safe_call(self.get_training_status, target_date)
+        training_status = await provenance.read(
+            "trainingStatus", self.get_training_status, target_date
+        )
+        # Keep today's load independent from the legacy VO2-driven fallback.
+        load_payload = training_status or {}
+        load_source = dict(provenance.sources["trainingStatus"])
         if not _has_vo2max(training_status):
-            yesterday_status = await self._safe_call(
-                self.get_training_status, yesterday_date
+            yesterday_status = await provenance.read(
+                "trainingStatusFallback", self.get_training_status, yesterday_date
             )
             if _has_vo2max(yesterday_status):
                 training_status = yesterday_status
+                provenance.select("trainingStatus", "trainingStatusFallback")
 
         # Endurance score — fall back to yesterday
-        endurance_data = await self._safe_call(self.get_endurance_score, target_date)
+        endurance_data = await provenance.read(
+            "endurance", self.get_endurance_score, target_date
+        )
         if not endurance_data or "overallScore" not in endurance_data:
-            endurance_data = await self._safe_call(
-                self.get_endurance_score, yesterday_date
+            endurance_data = await provenance.read(
+                "enduranceFallback", self.get_endurance_score, yesterday_date
             )
+            provenance.select("endurance", "enduranceFallback")
         endurance_score: dict[str, Any] = {"overallScore": None}
         if endurance_data and "overallScore" in endurance_data:
             endurance_score = endurance_data
 
         # Hill score — fall back to yesterday
-        hill_data = await self._safe_call(self.get_hill_score, target_date)
+        hill_data = await provenance.read("hill", self.get_hill_score, target_date)
         if not hill_data or "overallScore" not in hill_data:
-            hill_data = await self._safe_call(self.get_hill_score, yesterday_date)
+            hill_data = await provenance.read(
+                "hillFallback", self.get_hill_score, yesterday_date
+            )
+            provenance.select("hill", "hillFallback")
         hill_score: dict[str, Any] = {"overallScore": None}
         if hill_data and "overallScore" in hill_data:
             hill_score = hill_data
 
         # HRV — fall back to yesterday
-        hrv_data = await self._safe_call(self._get_hrv_data_raw, target_date)
+        hrv_data = await provenance.read("hrv", self._get_hrv_data_raw, target_date)
         if not hrv_data or "hrvSummary" not in hrv_data:
-            hrv_data = await self._safe_call(self._get_hrv_data_raw, yesterday_date)
+            hrv_data = await provenance.read(
+                "hrvFallback", self._get_hrv_data_raw, yesterday_date
+            )
+            provenance.select("hrv", "hrvFallback")
         hrv_status: dict[str, Any] = {"status": "unknown"}
         if hrv_data and "hrvSummary" in hrv_data:
             hrv_status = hrv_data["hrvSummary"]
 
         # Power to weight — fall back to yesterday
-        power_to_weight = await self._safe_call(self.get_power_to_weight, target_date)
+        power_to_weight = await provenance.read(
+            "powerToWeight", self.get_power_to_weight, target_date
+        )
         if not power_to_weight:
-            power_to_weight = await self._safe_call(
-                self.get_power_to_weight, yesterday_date
+            power_to_weight = await provenance.read(
+                "powerToWeightFallback", self.get_power_to_weight, yesterday_date
             )
+            provenance.select("powerToWeight", "powerToWeightFallback")
 
         data = {
             "trainingReadiness": training_readiness or {},
@@ -2950,6 +3012,25 @@ class GarminClient:
                 if activity_vo2 is not None:
                     result["vo2MaxValue"] = activity_vo2
 
+        load = normalize_training_load(load_payload, target_date)
+        if not load and training_status:
+            load = normalize_training_load(training_status, target_date)
+            load_source = dict(provenance.sources["trainingStatus"])
+        result.update(load)
+        load_source.update(
+            {
+                "source": "trainingLoad",
+                "source_date": load.get("trainingLoadSourceDate"),
+                "primary_device": load.get("trainingLoadPrimaryDevice"),
+                "selection": "primary"
+                if load.get("trainingLoadPrimaryDevice")
+                else "date_fallback",
+            }
+        )
+        provenance.sources["trainingLoad"] = load_source
+        result["_sources"] = {
+            k: v for k, v in provenance.sources.items() if not k.endswith("Fallback")
+        }
         return result
 
     async def fetch_body_data(self, target_date: date | None = None) -> dict[str, Any]:

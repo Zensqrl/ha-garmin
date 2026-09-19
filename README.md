@@ -1,5 +1,28 @@
 # ha-garmin
 
+### Daily decision data and provenance
+
+`fetch_core_data(target_date=...)` and `fetch_training_data(target_date=...)`
+accept the consumer's local calendar date. Their existing fields remain available;
+the additive `_sources` mapping describes each endpoint's `ok`, `empty`, or `error`
+outcome, requested/query/source dates, UTC fetch time, and explicit fallback use.
+A query date is not evidence of the returned observation's date. Missing source
+dates remain `None`. Fetch times are not device measurement times. Authentication
+and rate-limit exceptions continue to propagate. Metadata contains no raw error
+messages or account identifiers.
+
+Training aggregates additionally expose `acuteTrainingLoad`, `chronicTrainingLoad`,
+`trainingLoadRatio`, and `trainingLoadRatioStatus`. They come from a single device:
+prefer the requested date, then the primary training device, then latest date and
+a stable tie-breaker. Source date and primary-device selection are exposed. Today's
+load is kept independently of the existing VO2-driven training-status fallback.
+The existing status/VO2 fields retain their previous selection behavior.
+
+`trainingLoadChronicMin`/`trainingLoadChronicMax` retain the source fields' names
+and must not be presented as confirmed acute/weekly optimal bounds. Null values
+remain unknown; acute load is not a sum of activity loads. This change adds no
+endpoint requests, history backfill, or nutrition behavior.
+
 Python client for Garmin Connect API, designed for Home Assistant integration.
 
 ## Features
@@ -63,6 +86,33 @@ async def fetch_all():
 
 asyncio.run(fetch_all())
 ```
+
+### Historical coverage probe
+
+Before designing storage for intraday history, the read-only probe can test
+which older dates Garmin still returns for stress, Body Battery, and intraday
+steps. It prints only coverage metadata: dates, sample counts, time ranges,
+sampling intervals, gaps, and sanitized error categories. Raw metric values,
+credentials, tokens, profile names, and account identifiers are never included.
+
+Use a private token-store path outside the repository. On the first run, set
+`GARMIN_EMAIL` if desired and enter the password at the hidden prompt. The
+`GARMIN_PASSWORD` environment variable is also supported for unattended use,
+but a prompt leaves the password in fewer places. Later runs reuse the saved
+session token.
+
+```bash
+GARMIN_EMAIL="you@example.com" \
+python -m ha_garmin.history_probe \
+  --token-store ~/.ha-garmin-history-probe \
+  --output garmin-history-coverage.json
+```
+
+The default sample dates include a seven-day block around 30 days ago plus
+isolated dates up to one year old. Use `--offsets 1,7,30,90` or
+`--dates 2026-01-01,2026-06-01` to choose another set. Add
+`--discard-session` to remove the locally cached token after the run. All API
+calls made by the probe are GET requests.
 
 ### Home Assistant integration
 

@@ -1,5 +1,7 @@
 """One device with nothing to report must not sink the whole training fetch."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from ha_garmin.client import _add_computed_fields
@@ -112,10 +114,8 @@ async def test_the_whole_training_fetch_survives_a_quiet_device() -> None:
         "mostRecentVO2Max": {"generic": {"vo2MaxValue": 48}},
     }
 
-    async def _only_status(func, *args, **kwargs):
-        return status if func.__name__ == "get_training_status" else {}
-
-    client._safe_call = _only_status  # type: ignore[method-assign]
+    client._request = AsyncMock(return_value={})
+    client.get_training_status = AsyncMock(return_value=status)
 
     result = await client.fetch_training_data()
 

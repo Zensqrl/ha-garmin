@@ -58,6 +58,57 @@ class TestGarminClient:
         assert profile.id == 12345
         assert profile.profile_id == 67890
 
+    async def test_get_steps_data_uses_quoted_profile_and_requested_date(self):
+        """Intraday step charts require the profile path and date query."""
+        auth = _make_auth()
+        client = GarminClient(auth)
+        profile = MagicMock(display_name="user/name")
+
+        with (
+            patch.object(client, "get_user_profile", return_value=profile),
+            patch.object(client, "_request", new_callable=AsyncMock) as request,
+        ):
+            request.return_value = [{"steps": 10}]
+            result = await client.get_steps_data(date(2026, 9, 1))
+
+        assert result == [{"steps": 10}]
+        request.assert_awaited_once()
+        assert request.call_args.args[0] == "GET"
+        assert request.call_args.args[1].endswith("/user%2Fname")
+        assert request.call_args.kwargs["params"] == {"date": "2026-09-01"}
+
+    async def test_get_daily_stress_uses_requested_date(self):
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as request:
+            request.return_value = {"calendarDate": "2026-09-01"}
+            result = await client.get_daily_stress(date(2026, 9, 1))
+
+        assert result == {"calendarDate": "2026-09-01"}
+        assert request.call_args.args[1].endswith("/dailyStress/2026-09-01")
+
+    async def test_get_body_battery_uses_inclusive_date_range(self):
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        with patch.object(client, "_request", new_callable=AsyncMock) as request:
+            request.return_value = [{"date": "2026-09-01"}]
+            result = await client.get_body_battery(date(2026, 9, 1), date(2026, 9, 2))
+
+        assert result == [{"date": "2026-09-01"}]
+        assert request.call_args.kwargs["params"] == {
+            "startDate": "2026-09-01",
+            "endDate": "2026-09-02",
+        }
+
+    async def test_get_body_battery_rejects_reversed_range(self):
+        auth = _make_auth()
+        client = GarminClient(auth)
+
+        with pytest.raises(ValueError, match="start_date cannot be after end_date"):
+            await client.get_body_battery(date(2026, 9, 2), date(2026, 9, 1))
+
     async def test_get_activities_by_recency(self):
         """Test get_activities queries by start/limit without date filters."""
         auth = _make_auth()
@@ -1184,12 +1235,8 @@ class TestGarminClient:
             {"sport": "RUNNING", "functionalThresholdPower": 425, "powerToWeight": 4.84}
         ]
 
-        async def mock_safe_call(func, *args, **kwargs):
-            if func == client.get_power_to_weight:
-                return ptw_payload
-            return {}
-
-        client._safe_call = mock_safe_call
+        client._request = AsyncMock(return_value={})
+        client.get_power_to_weight = AsyncMock(return_value=ptw_payload)
         data = await client.fetch_training_data()
 
         assert "powerToWeight" in data
@@ -1204,17 +1251,8 @@ class TestGarminClient:
             {"sport": "RUNNING", "functionalThresholdPower": 420, "powerToWeight": 4.78}
         ]
 
-        call_count = {"n": 0}
-
-        async def mock_safe_call(func, *args, **kwargs):
-            if func == client.get_power_to_weight:
-                call_count["n"] += 1
-                if call_count["n"] == 1:
-                    return []  # today: empty
-                return ptw_yesterday  # yesterday: has data
-            return {}
-
-        client._safe_call = mock_safe_call
+        client._request = AsyncMock(return_value={})
+        client.get_power_to_weight = AsyncMock(side_effect=[[], ptw_yesterday])
         data = await client.fetch_training_data()
 
         assert data["powerToWeight"] == ptw_yesterday
