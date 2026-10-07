@@ -34,7 +34,13 @@ jobs:
       - name: Assess drift and file issue
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          resolved_repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+          if [ "$resolved_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "Repository target mismatch; refusing issue operations." >&2
+            exit 1
+          fi
           title="${ISSUE_TITLE_PREFIX} ${UPSTREAM_REPO}"
           existing=$(gh issue list --state open --search "\"${title}\" in:title" \
             --json number,title --jq "[.[] | select(.title | startswith(\"${title}\"))][0].number // empty")
