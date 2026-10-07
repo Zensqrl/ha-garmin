@@ -3,14 +3,26 @@ version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     schedule:
-      interval: daily
+      interval: weekly
       time: "20:00"
       timezone: "Europe/Amsterdam"
 
   - package-ecosystem: "pip"
     directory: "/"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     schedule:
-      interval: daily
+      interval: weekly
       time: "20:00"
       timezone: "Europe/Amsterdam"
