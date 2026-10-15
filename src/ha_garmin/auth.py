@@ -42,6 +42,14 @@ from .models import AuthResult
 
 _LOGGER = logging.getLogger(__name__)
 
+# A 401 from the API tier means the token itself is refused, but a 403 can
+# also mean Garmin is blocking the client or network making the call, in
+# which case the token may be fine and the "token rejected" wording misleads.
+_API_REJECTION_HINT = (
+    "a 403 here can also mean Garmin is blocking this client or network "
+    "rather than rejecting the token"
+)
+
 # Detect ~username expansion that would point into another user's home directory.
 _OTHER_USER_HOME_RE = re.compile(r"^~[^/\\]")
 
@@ -222,6 +230,10 @@ class GarminAuth:
         # is held on this instance. Prevents interleaving another login on the
         # same instance while MFA is pending.
         self._mfa_pending = False
+        # HTTP status of the last API-tier rejection seen by _verify_token(),
+        # so callers can tell a 401 (token refused) from a 403 (possibly a
+        # client/network block) when they report it.
+        self._last_rejection_status: int | None = None
 
     @property
     def is_authenticated(self) -> bool:
@@ -276,6 +288,7 @@ class GarminAuth:
         definitive auth rejection (401/403) returns False, so a transient
         network error or 5xx never blocks an otherwise-working login.
         """
+        self._last_rejection_status = None
         if not self.is_authenticated:
             return False
         try:
@@ -292,9 +305,24 @@ class GarminAuth:
             )
             return True
         if r.status_code in (401, 403):
+            self._last_rejection_status = r.status_code
             _LOGGER.warning("Token rejected by API tier: HTTP %s", r.status_code)
             return False
         return True
+
+    def _token_rejected_message(self, prefix: str) -> str:
+        """Describe the last _verify_token() rejection, with its HTTP status.
+
+        A 403 gets a hint that the cause may be a client/network block rather
+        than the token, so users don't chase a token problem that isn't one.
+        """
+        status = self._last_rejection_status
+        if status is None:
+            return prefix
+        message = f"{prefix} (HTTP {status})"
+        if status == 403:
+            message += f"; {_API_REJECTION_HINT}"
+        return message
 
     def _token_expires_soon(self) -> bool:
         """Check if the active token will expire within 15 minutes."""
@@ -383,8 +411,12 @@ class GarminAuth:
                         "%s obtained a token the API rejected; trying next strategy",
                         name,
                     )
+                    last_err = GarminAPIError(
+                        self._token_rejected_message(
+                            f"{name}: token rejected by API tier"
+                        )
+                    )
                     self._clear_auth_state()
-                    last_err = GarminAPIError(f"{name}: token rejected by API tier")
                     continue
                 return result
             except (GarminAuthError, GarminMFARequired):
@@ -938,9 +970,12 @@ class GarminAuth:
             # here — but still fail loudly rather than store a token the API tier
             # rejects (see _verify_token).
             if not self._verify_token():
+                message = self._token_rejected_message(
+                    "Token rejected by API tier after MFA"
+                )
                 self._clear_auth_state()
                 self._clear_mfa_state()
-                raise GarminAuthError("Token rejected by API tier after MFA")
+                raise GarminAuthError(message)
             return AuthResult(success=True)
         finally:
             # Always clear the pending MFA flag and per-attempt state so a new
@@ -1090,11 +1125,10 @@ class GarminAuth:
             if r.status_code == 429:
                 raise GarminRateLimitError("DI token exchange rate limited")
             if not r.ok:
+                # Log only the status: the error body from the token endpoint
+                # isn't needed to diagnose a failed exchange.
                 _LOGGER.debug(
-                    "DI exchange failed for %s: %s %s",
-                    client_id,
-                    r.status_code,
-                    r.text[:200],
+                    "DI exchange failed for %s: HTTP %s", client_id, r.status_code
                 )
                 continue
             try:

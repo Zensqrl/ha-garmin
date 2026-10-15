@@ -77,6 +77,67 @@ class TestGarminAuth:
         auth = GarminAuth()
         assert auth._verify_token() is False
 
+    @pytest.mark.parametrize(("status", "hinted"), [(401, False), (403, True)])
+    async def test_rejected_strategy_error_names_status(self, status, hinted):
+        """The login error carries the HTTP status; only a 403 gets the
+        client/network-block hint, since a 401 really is a refused token.
+        """
+        from ha_garmin.models import AuthResult
+
+        auth = GarminAuth()
+
+        def strategy(_email, _password):
+            auth.di_token = "tok"
+            return AuthResult(success=True)
+
+        with (
+            patch.object(auth, "_mobile_login_cffi", side_effect=strategy),
+            patch.object(auth, "_mobile_login_requests", side_effect=strategy),
+            patch.object(auth, "_widget_web_login", side_effect=strategy),
+            patch.object(auth, "_portal_web_login_cffi", side_effect=strategy),
+            patch.object(auth, "_portal_web_login_requests", side_effect=strategy),
+            patch(
+                "ha_garmin.auth.cffi_requests.get",
+                return_value=MagicMock(status_code=status),
+            ),
+            pytest.raises(GarminAPIError) as excinfo,
+        ):
+            auth.login("e@x.com", "pw")
+        message = str(excinfo.value)
+        assert f"token rejected by API tier (HTTP {status})" in message
+        assert ("client or network" in message) is hinted
+
+    async def test_rejected_mfa_token_error_hints_on_403(self):
+        """complete_mfa() reports a 403 rejection with the same hint."""
+        auth = GarminAuth()
+        auth._mfa_session = MagicMock()  # an MFA login is pending
+
+        def complete(_code):
+            auth.di_token = "tok"
+
+        with (
+            patch.object(auth, "_complete_mfa", side_effect=complete),
+            patch(
+                "ha_garmin.auth.cffi_requests.get",
+                return_value=MagicMock(status_code=403),
+            ),
+            pytest.raises(GarminAuthError, match=r"HTTP 403.*client or network"),
+        ):
+            auth.complete_mfa("123456")
+
+    async def test_verify_token_success_clears_last_rejection(self):
+        """An accepted token must not keep an earlier rejection's status."""
+        auth = GarminAuth()
+        auth.di_token = "tok"
+        auth._last_rejection_status = 403
+        with patch(
+            "ha_garmin.auth.cffi_requests.get",
+            return_value=MagicMock(status_code=200),
+        ):
+            assert auth._verify_token() is True
+        assert auth._last_rejection_status is None
+        assert auth._token_rejected_message("x") == "x"
+
     async def test_login_falls_through_rejected_token(self):
         """A strategy whose token the API rejects must not win the chain;
         the next strategy that validates should.
@@ -523,3 +584,17 @@ class TestSecurityAuditHardening:
         assert "bar" not in out
         assert "ticket=<redacted>" in out
         assert "foo=<redacted>" in out
+
+
+def test_di_exchange_failure_log_omits_response_body(caplog):
+    """A failed DI exchange logs the status, never the token endpoint's body."""
+    auth = GarminAuth()
+    failed = MagicMock(ok=False, status_code=400, text="ST-CANARY-TICKET-123 detail")
+    with (
+        patch("ha_garmin.auth._http_post", return_value=failed),
+        caplog.at_level("DEBUG", logger="ha_garmin.auth"),
+        pytest.raises(GarminAuthError),
+    ):
+        auth._exchange_service_ticket("ST-CANARY-TICKET-123")
+    assert "HTTP 400" in caplog.text
+    assert "ST-CANARY-TICKET-123" not in caplog.text

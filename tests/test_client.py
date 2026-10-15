@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from ha_garmin import GarminAuth, GarminClient
-from ha_garmin.exceptions import GarminAPIError, GarminAuthError
+from ha_garmin.const import GARMIN_CONNECT_API
+from ha_garmin.exceptions import GarminAPIError, GarminAuthError, GarminTLSError
 
 
 def _make_auth(di_token: str = "fake_di_token") -> GarminAuth:
@@ -1559,6 +1560,61 @@ class TestGarminClient:
 
         assert result == {}
 
+    async def test_request_raises_tls_error_on_untrusted_certificate(self):
+        """A failed certificate check means interception, not a flaky endpoint."""
+        import ssl
+
+        import requests
+        from urllib3.exceptions import MaxRetryError
+        from urllib3.exceptions import SSLError as Urllib3SSLError
+
+        client = GarminClient(_make_auth(), is_cn=True)
+        cert_err = ssl.SSLCertVerificationError(
+            1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+        )
+        cert_err.verify_message = "self-signed certificate"
+        wrapped = requests.exceptions.SSLError(
+            MaxRetryError(MagicMock(), "/test", Urllib3SSLError(cert_err))
+        )
+
+        with (
+            patch("asyncio.to_thread", new_callable=AsyncMock, side_effect=wrapped),
+            pytest.raises(GarminTLSError) as excinfo,
+        ):
+            await client._request("GET", f"{GARMIN_CONNECT_API}/test")
+
+        message = str(excinfo.value)
+        assert "connectapi.garmin.cn" in message
+        assert "self-signed certificate" in message
+        assert not isinstance(excinfo.value, GarminAPIError)
+
+    async def test_request_keeps_api_error_for_other_ssl_failures(self):
+        """A dropped handshake is transient; only certificate failures abort."""
+        import ssl
+
+        import requests
+
+        client = GarminClient(_make_auth())
+        wrapped = requests.exceptions.SSLError(
+            ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+        )
+
+        with (
+            patch("asyncio.to_thread", new_callable=AsyncMock, side_effect=wrapped),
+            pytest.raises(GarminAPIError, match="Request failed"),
+        ):
+            await client._request("GET", f"{GARMIN_CONNECT_API}/test")
+
+    async def test_safe_call_does_not_swallow_tls_error(self):
+        """_safe_call skips a failing endpoint, but a TLS failure ends the fetch."""
+        client = GarminClient(_make_auth())
+
+        async def failing() -> None:
+            raise GarminTLSError("intercepted")
+
+        with pytest.raises(GarminTLSError):
+            await client._safe_call(failing)
+
     async def test_get_body_composition_uses_daily_weight_summaries(self):
         """Test get_body_composition returns latest weight from dailyWeightSummaries."""
         auth = _make_auth()
@@ -2353,6 +2409,57 @@ class TestGarminClient:
             )
 
 
+class TestUploadActivityLogging:
+    """upload_activity() must not log Garmin's full upload response."""
+
+    _RESULT = {
+        "detailedImportResult": {
+            "uploadId": 123456789,
+            "uploadUuid": {"uuid": "secret-upload-uuid"},
+            "owner": 987654321,
+            "fileName": "ride.fit",
+            "successes": [],
+            "failures": [
+                {
+                    "internalId": 555,
+                    "messages": [{"code": 202, "content": "Duplicate Activity."}],
+                }
+            ],
+        }
+    }
+
+    async def test_warning_logs_messages_not_body(self, tmp_path, caplog):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b"fit")
+        client = GarminClient(_make_auth())
+        with (
+            patch("requests.post", return_value=_mock_response(self._RESULT, 400)),
+            caplog.at_level("WARNING", logger="ha_garmin.client"),
+        ):
+            body = await client.upload_activity(str(fit))
+        assert body == self._RESULT
+        assert "Upload accepted with warnings: Duplicate Activity." in caplog.text
+        assert "987654321" not in caplog.text
+        assert "secret-upload-uuid" not in caplog.text
+
+    async def test_failure_error_lists_failure_messages(self, tmp_path):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b"fit")
+        client = GarminClient(_make_auth())
+        result = {
+            "detailedImportResult": {
+                "failures": [
+                    {"messages": [{"content": "Bad file"}, {"content": "Really bad"}]}
+                ]
+            }
+        }
+        with (
+            patch("requests.post", return_value=_mock_response(result, 500)),
+            pytest.raises(GarminAPIError, match="Upload failed: Bad file; Really bad"),
+        ):
+            await client.upload_activity(str(fit))
+
+
 class TestSecurityAuditHardening:
     """Regression tests for the python-garminconnect audit cross-check."""
 
@@ -2614,3 +2721,45 @@ class TestGarminCalendarZone:
         entry = payload["quickAddItems"][0]
         assert entry["logTimestamp"] == "2026-04-17T22:00:00.000Z"
         assert entry["mealTime"] == "01:00:00"
+
+
+class TestValidatePositiveInt:
+    """IDs must not be silently truncated, and the URL gets the clean int."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(123, 123), ("123", 123), (" 123 ", 123), (123.0, 123)],
+    )
+    def test_accepts_integral_values(self, value, expected):
+        from ha_garmin.client import _validate_positive_int
+
+        assert _validate_positive_int(value, "x") == expected
+
+    @pytest.mark.parametrize(
+        "value", [1.9, "1.9", "abc", "", None, True, [1], 0, -5, "0", 0.0]
+    )
+    def test_rejects_non_integral_or_non_positive(self, value):
+        from ha_garmin.client import _validate_positive_int
+
+        with pytest.raises(ValueError, match="x must be a positive integer"):
+            _validate_positive_int(value, "x")
+
+    async def test_url_uses_cleaned_id(self):
+        from ha_garmin.const import ADAPTIVE_TRAINING_PLAN_URL
+
+        client = GarminClient(_make_auth())
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = {}
+            await client.get_adaptive_training_plan_by_id(1789148356.0)
+        mock_req.assert_awaited_once_with(
+            "GET", f"{ADAPTIVE_TRAINING_PLAN_URL}/1789148356"
+        )
+
+    async def test_fractional_id_rejected_without_request(self):
+        client = GarminClient(_make_auth())
+        with (
+            patch.object(client, "_request", new_callable=AsyncMock) as mock_req,
+            pytest.raises(ValueError),
+        ):
+            await client.get_adaptive_training_plan_by_id(1.9)
+        mock_req.assert_not_awaited()
