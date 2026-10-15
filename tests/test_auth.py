@@ -523,3 +523,17 @@ class TestSecurityAuditHardening:
         assert "bar" not in out
         assert "ticket=<redacted>" in out
         assert "foo=<redacted>" in out
+
+
+def test_di_exchange_failure_log_omits_response_body(caplog):
+    """A failed DI exchange logs the status, never the token endpoint's body."""
+    auth = GarminAuth()
+    failed = MagicMock(ok=False, status_code=400, text="ST-CANARY-TICKET-123 detail")
+    with (
+        patch("ha_garmin.auth._http_post", return_value=failed),
+        caplog.at_level("DEBUG", logger="ha_garmin.auth"),
+        pytest.raises(GarminAuthError),
+    ):
+        auth._exchange_service_ticket("ST-CANARY-TICKET-123")
+    assert "HTTP 400" in caplog.text
+    assert "ST-CANARY-TICKET-123" not in caplog.text
