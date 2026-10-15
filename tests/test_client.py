@@ -2630,6 +2630,99 @@ class TestSecurityAuditHardening:
         assert _sanitize_filename("normal.fit") == "normal.fit"
 
 
+class TestGarminCalendarZone:
+    """The Garmin calendar day must not depend on the process time zone."""
+
+    def test_fallback_zone_used_before_offset_is_learned(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        assert client.now().utcoffset() == timedelta(hours=3)
+
+    def test_invalid_zone_falls_back_to_system(self, caplog):
+        client = GarminClient(_make_auth(), timezone="Not/AZone")
+        assert "Invalid timezone" in caplog.text
+        assert client.now().utcoffset() == datetime.now().astimezone().utcoffset()
+
+    def test_learned_offset_overrides_disagreeing_zone(self):
+        """A device in another zone (travel) defines the Garmin day."""
+        client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        client._learn_utc_offset(
+            {
+                "wellnessStartTimeLocal": "2026-01-02T00:00:00.0",
+                "wellnessStartTimeGmt": "2026-01-02T08:00:00.0",
+            }
+        )
+        assert client.now().utcoffset() == timedelta(hours=-8)
+
+    def test_agreeing_zone_is_kept_for_dst(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        client._learn_utc_offset(
+            {
+                "wellnessStartTimeLocal": "2026-01-02T00:00:00.0",
+                "wellnessStartTimeGmt": "2026-01-01T21:00:00.0",
+            }
+        )
+        assert str(client.now().tzinfo) == "Europe/Istanbul"
+
+    @pytest.mark.parametrize(
+        "summary",
+        [
+            {},
+            {"wellnessStartTimeLocal": "garbage", "wellnessStartTimeGmt": "x"},
+            {
+                "wellnessStartTimeLocal": "2026-01-02T00:13:00.0",
+                "wellnessStartTimeGmt": "2026-01-02T00:00:00.0",
+            },
+            {
+                "wellnessStartTimeLocal": "2026-01-03T00:00:00.0",
+                "wellnessStartTimeGmt": "2026-01-02T00:00:00.0",
+            },
+        ],
+    )
+    def test_implausible_offsets_are_ignored(self, summary):
+        client = GarminClient(_make_auth())
+        client._learn_utc_offset(summary)
+        assert client._garmin_utc_offset is None
+
+    async def test_user_summary_learns_offset(self):
+        client = GarminClient(_make_auth())
+        client.get_user_profile = AsyncMock(return_value=MagicMock(display_name="me"))
+        client._request = AsyncMock(
+            return_value={
+                "wellnessStartTimeLocal": "2026-01-02T00:00:00.0",
+                "wellnessStartTimeGmt": "2026-01-01T21:00:00.0",
+            }
+        )
+        await client._get_user_summary_raw(date(2026, 1, 2))
+        assert client._garmin_utc_offset == timedelta(hours=3)
+
+    async def test_hydration_calendar_date_follows_timestamp(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        client._put_request = AsyncMock(return_value={})
+        await client.set_hydration(250, timestamp="2026-04-17T23:30:00")
+        payload = client._put_request.call_args.args[1]
+        assert payload["calendarDate"] == "2026-04-17"
+        assert payload["timestampLocal"] == "2026-04-17T23:30:00.000"
+
+    async def test_blood_pressure_aware_timestamp_uses_garmin_zone(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        client._post_request = AsyncMock(return_value={})
+        await client.set_blood_pressure(120, 80, timestamp="2026-01-01T21:30:00+00:00")
+        payload = client._post_request.call_args.args[1]
+        assert payload["measurementTimestampLocal"] == "2026-01-02T00:30:00.000"
+        assert payload["measurementTimestampGMT"] == "2026-01-01T21:30:00.000"
+
+    async def test_nutrition_naive_timestamp_is_garmin_local(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        client._put_request = AsyncMock(return_value={})
+        client._get_nutrition_meal = AsyncMock(return_value=(1, "00:00:00"))
+        await client.add_nutrition_log(calories=100, timestamp="2026-04-18T01:00:00")
+        payload = client._put_request.call_args.args[1]
+        assert payload["mealDate"] == "2026-04-18"
+        entry = payload["quickAddItems"][0]
+        assert entry["logTimestamp"] == "2026-04-17T22:00:00.000Z"
+        assert entry["mealTime"] == "01:00:00"
+
+
 class TestValidatePositiveInt:
     """IDs must not be silently truncated, and the URL gets the clean int."""
 

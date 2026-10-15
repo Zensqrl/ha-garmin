@@ -8,9 +8,11 @@ import logging
 import numbers
 import re
 import ssl
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
+from datetime import timezone as fixed_timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .const import (
     ACTIVITIES_URL,
@@ -1024,14 +1026,26 @@ class GarminClient:
         self,
         auth: GarminAuth,
         is_cn: bool = False,
+        timezone: str | None = None,
     ) -> None:
         """Initialize client.
 
         Args:
             auth: GarminAuth instance with tokens
             is_cn: Use Chinese Garmin Connect domain
+            timezone: IANA zone (e.g. "Europe/Amsterdam") used for "today" and
+                default timestamps until the Garmin account's own UTC offset
+                is learned from a daily summary. Defaults to the system zone.
         """
         self._auth = auth
+        self._fallback_tz: ZoneInfo | None = None
+        if timezone:
+            try:
+                self._fallback_tz = ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                _LOGGER.warning("Invalid timezone '%s', using system zone", timezone)
+        # UTC offset of the Garmin calendar day, learned from daily summaries.
+        self._garmin_utc_offset: timedelta | None = None
         self._is_cn = is_cn
         self._base_url = GARMIN_CN_CONNECT_API if is_cn else GARMIN_CONNECT_API
         self._profile_cache: UserProfile | None = None
@@ -1040,6 +1054,63 @@ class GarminClient:
             self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
         )
         self._connect_iq_cache = _PerActivityCache(self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT)
+
+    def _local_tz(self) -> tzinfo:
+        """Return the zone that defines the Garmin calendar day.
+
+        Garmin keys daily data by the device's local date, which can differ
+        from the system zone (e.g. a UTC container) and from the configured
+        zone (e.g. while travelling). Preference order: the configured zone
+        when it agrees with the learned Garmin offset (keeps DST correct),
+        the learned fixed offset, the configured zone, the system zone.
+        """
+        offset = self._garmin_utc_offset
+        fallback = self._fallback_tz
+        if offset is not None:
+            if fallback is not None and datetime.now(fallback).utcoffset() == offset:
+                return fallback
+            return fixed_timezone(offset)
+        if fallback is not None:
+            return fallback
+        return datetime.now().astimezone().tzinfo or UTC
+
+    def now(self) -> datetime:
+        """Return the current time in the Garmin calendar zone (aware)."""
+        return datetime.now(self._local_tz())
+
+    def today(self) -> date:
+        """Return the current Garmin calendar date."""
+        return self.now().date()
+
+    def _parse_local_timestamp(self, timestamp: str | None) -> datetime:
+        """Parse an ISO timestamp into an aware datetime in the Garmin zone.
+
+        None means now; a naive timestamp is wall-clock time in the Garmin zone.
+        """
+        tz = self._local_tz()
+        if timestamp is None:
+            return datetime.now(tz)
+        dt = datetime.fromisoformat(timestamp)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
+    def _learn_utc_offset(self, summary: dict[str, Any]) -> None:
+        """Record the Garmin day's UTC offset from a raw daily summary."""
+        local = summary.get("wellnessStartTimeLocal")
+        gmt = summary.get("wellnessStartTimeGmt")
+        if not isinstance(local, str) or not isinstance(gmt, str):
+            return
+        try:
+            offset = datetime.fromisoformat(local) - datetime.fromisoformat(gmt)
+        except ValueError:
+            return
+        # Real offsets are whole quarter hours within +/-14h.
+        if abs(offset) > timedelta(hours=14) or offset % timedelta(minutes=15):
+            return
+        if offset != self._garmin_utc_offset:
+            _LOGGER.debug("Garmin calendar UTC offset: %s", offset)
+            self._garmin_utc_offset = offset
 
     def _get_url(self, url: str) -> str:
         """Resolve URL to correct connectapi domain."""
@@ -1262,7 +1333,6 @@ class GarminClient:
             alarmDays can be: ONCE, MONDAY, TUESDAY, etc.
         """
         from datetime import datetime
-        from zoneinfo import ZoneInfo
 
         if not alarms or not timezone:
             _LOGGER.debug("No alarms or timezone provided")
@@ -1412,7 +1482,7 @@ class GarminClient:
         individual measurements are available.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         start = (target_date - timedelta(days=30)).isoformat()
         end = target_date.isoformat()
@@ -1645,7 +1715,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get hydration data for a date."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{HYDRATION_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1656,7 +1726,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get training readiness data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{TRAINING_READINESS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1674,7 +1744,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get training status data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{TRAINING_STATUS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1685,7 +1755,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get endurance score."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         params = {"calendarDate": target_date.isoformat()}
         data = await self._request("GET", ENDURANCE_SCORE_URL, params=params)
@@ -1694,7 +1764,7 @@ class GarminClient:
     async def get_hill_score(self, target_date: date | None = None) -> dict[str, Any]:
         """Get hill score."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         params = {"calendarDate": target_date.isoformat()}
         data = await self._request("GET", HILL_SCORE_URL, params=params)
@@ -1703,7 +1773,7 @@ class GarminClient:
     async def get_fitness_age(self, target_date: date | None = None) -> dict[str, Any]:
         """Get fitness age data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{FITNESS_AGE_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1730,7 +1800,7 @@ class GarminClient:
     ) -> list[dict[str, Any]]:
         """Get power-to-weight (FTP) data for a date."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{POWER_TO_WEIGHT_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1752,7 +1822,7 @@ class GarminClient:
         """
         device_id = _validate_positive_int(device_id, "device_id")
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         day = target_date.isoformat()
         url = f"{DEVICE_SOLAR_URL}/{device_id}/{day}/{day}"
@@ -1825,7 +1895,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get menstrual cycle data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{MENSTRUAL_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1839,9 +1909,9 @@ class GarminClient:
         Returns cycle summaries including predicted cycles.
         """
         if start_date is None:
-            start_date = date.today() - timedelta(days=30)
+            start_date = self.today() - timedelta(days=30)
         if end_date is None:
-            end_date = date.today() + timedelta(days=60)
+            end_date = self.today() + timedelta(days=60)
 
         if start_date > end_date:
             raise ValueError("start_date cannot be after end_date")
@@ -1864,7 +1934,7 @@ class GarminClient:
         Returns {} when the account has no nutrition setup (endpoint 404s).
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
         data = await self._request(
             "GET", f"{NUTRITION_LOGS_URL}/{target_date.isoformat()}"
         )
@@ -1875,7 +1945,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get daily summary as raw dict for flat data output."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         profile = await self.get_user_profile()
         # display_name comes from the server; quote it so a hostile response
@@ -1883,14 +1953,17 @@ class GarminClient:
         url = f"{USER_SUMMARY_URL}/{quote(profile.display_name, safe='')}"
         params = {"calendarDate": target_date.isoformat()}
         data = await self._request("GET", url, params=params)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        self._learn_utc_offset(data)
+        return data
 
     async def _get_sleep_data_raw(
         self, target_date: date | None = None
     ) -> dict[str, Any]:
         """Get sleep data as raw dict for flat data output."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = SLEEP_URL
         params = {"date": target_date.isoformat(), "nonSleepBufferMinutes": 60}
@@ -1902,7 +1975,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get HRV data as raw dict for flat data output."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{HRV_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1952,7 +2025,7 @@ class GarminClient:
         with inputContext == 'AFTER_WAKEUP_RESET'.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{TRAINING_READINESS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -2159,10 +2232,9 @@ class GarminClient:
             diastolic: Diastolic blood pressure (40-150)
             pulse: Pulse rate (20-250). Optional - Garmin Connect's own UI
                 accepts a blood pressure entry without a heart rate.
-            timestamp: ISO timestamp (defaults to now)
+            timestamp: ISO timestamp (defaults to now; naive means Garmin local time)
             notes: Optional notes
         """
-        from datetime import datetime
 
         _LOGGER.debug(
             "set_blood_pressure called with systolic=%s, diastolic=%s, pulse=%s, timestamp=%s",
@@ -2172,7 +2244,7 @@ class GarminClient:
             timestamp,
         )
 
-        dt = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        dt = self._parse_local_timestamp(timestamp)
         dt_gmt = dt.astimezone(UTC)
 
         def fmt_ts(d: datetime) -> str:
@@ -2203,18 +2275,18 @@ class GarminClient:
 
         Args:
             value_in_ml: Amount in millilitres (positive to add, negative to subtract, max 10000)
-            cdate: Calendar date YYYY-MM-DD (defaults to today)
-            timestamp: ISO timestamp, with or without milliseconds (defaults to now)
+            cdate: Calendar date YYYY-MM-DD (defaults to the timestamp's date)
+            timestamp: ISO timestamp, with or without milliseconds (defaults to
+                now; naive means Garmin local time)
         """
-        from datetime import datetime
 
         if abs(value_in_ml) > 10000:
             raise ValueError("Hydration value cannot exceed 10000 mL")
 
-        dt = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        dt = self._parse_local_timestamp(timestamp)
         timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
         if cdate is None:
-            cdate = date.today().isoformat()
+            cdate = dt.date().isoformat()
 
         payload = {
             "calendarDate": cdate,
@@ -2287,31 +2359,17 @@ class GarminClient:
             fat: Fat in grams
             name: Label for the log entry
             meal_time: Meal time as HH:MM:SS (defaults to current time)
-            timestamp: ISO 8601 timestamp (defaults to now)
+            timestamp: ISO 8601 timestamp (defaults to now; naive means
+                Garmin local time)
             meal_id: Garmin meal slot ID. If not provided, fetched from today's
                      log; falls back to null which lets Garmin assign it.
         """
-        now_utc = datetime.now(UTC)
-        now_local = now_utc.astimezone()
-        log_date = now_local.strftime("%Y-%m-%d")
-
-        if timestamp is None:
-            log_timestamp = (
-                now_utc.strftime("%Y-%m-%dT%H:%M:%S.")
-                + f"{now_utc.microsecond // 1000:03d}Z"
-            )
-            local_time = now_local
-        else:
-            dt = datetime.fromisoformat(timestamp)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-            dt_utc = dt.astimezone(UTC)
-            local_time = dt.astimezone()
-            log_date = local_time.strftime("%Y-%m-%d")
-            log_timestamp = (
-                dt_utc.strftime("%Y-%m-%dT%H:%M:%S.")
-                + f"{dt_utc.microsecond // 1000:03d}Z"
-            )
+        local_time = self._parse_local_timestamp(timestamp)
+        dt_utc = local_time.astimezone(UTC)
+        log_date = local_time.strftime("%Y-%m-%d")
+        log_timestamp = (
+            dt_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt_utc.microsecond // 1000:03d}Z"
+        )
 
         if meal_time is None:
             meal_time = local_time.strftime("%H:%M:%S")
@@ -2368,7 +2426,7 @@ class GarminClient:
 
         Args:
             weight: Weight in kg (required)
-            timestamp: ISO timestamp (defaults to now)
+            timestamp: ISO timestamp (defaults to now; naive means Garmin local time)
             percent_fat: Body fat percentage
             percent_hydration: Hydration percentage
             visceral_fat_mass: Visceral fat mass in kg
@@ -2381,7 +2439,6 @@ class GarminClient:
             visceral_fat_rating: Visceral fat rating (1-59)
             bmi: Body mass index
         """
-        from datetime import datetime
 
         from .fit import FitEncoderWeight  # type: ignore[attr-defined]
 
@@ -2391,7 +2448,7 @@ class GarminClient:
             timestamp,
         )
 
-        dt = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        dt = self._parse_local_timestamp(timestamp)
 
         # Build FIT file
         fit_encoder = FitEncoderWeight()
@@ -2681,7 +2738,7 @@ class GarminClient:
         API calls: get_user_summary, get_daily_steps, get_sleep_data (3 calls)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         yesterday_date = target_date - timedelta(days=1)
         week_ago = target_date - timedelta(days=7)
@@ -2964,7 +3021,7 @@ class GarminClient:
         # Training calendar: Garmin Coach / adaptive-plan sessions and
         # self-scheduled workouts. Fetches this month and next so a
         # session right after a month boundary isn't missed.
-        today = date.today()
+        today = target_date or self.today()
         next_month = today.month + 1 if today.month < 12 else 1
         next_month_year = today.year if today.month < 12 else today.year + 1
         calendar_this_month = (
@@ -3043,7 +3100,7 @@ class GarminClient:
         that go stale (training_status, HRV, scores) we fall back to yesterday.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         yesterday_date = target_date - timedelta(days=1)
 
@@ -3143,7 +3200,7 @@ class GarminClient:
         API calls: get_body_composition, get_hydration_data, get_fitness_age (3 calls)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         body_composition = await self._safe_call(self.get_body_composition, target_date)
         body_composition = body_composition or {}
@@ -3378,7 +3435,7 @@ class GarminClient:
         API calls: get_blood_pressure (1 call)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         blood_pressure_data: dict[str, Any] = {}
         # 365-day window: BP is logged manually and often infrequently; a
@@ -3433,7 +3490,7 @@ class GarminClient:
         API calls: get_menstrual_data, get_menstrual_calendar (2 calls)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         menstrual_data = await self._safe_call(self.get_menstrual_data, target_date)
         menstrual_data = menstrual_data or {}
@@ -3456,7 +3513,7 @@ class GarminClient:
         Returns {} when the account has no Connect+ nutrition setup.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         log = await self._safe_call(self.get_nutrition_log, target_date)
         if not log:
