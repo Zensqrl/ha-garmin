@@ -2577,3 +2577,45 @@ class TestSecurityAuditHardening:
 
         assert _sanitize_filename('a"\r\nb\\c.fit') == "a___b_c.fit"
         assert _sanitize_filename("normal.fit") == "normal.fit"
+
+
+class TestValidatePositiveInt:
+    """IDs must not be silently truncated, and the URL gets the clean int."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(123, 123), ("123", 123), (" 123 ", 123), (123.0, 123)],
+    )
+    def test_accepts_integral_values(self, value, expected):
+        from ha_garmin.client import _validate_positive_int
+
+        assert _validate_positive_int(value, "x") == expected
+
+    @pytest.mark.parametrize(
+        "value", [1.9, "1.9", "abc", "", None, True, [1], 0, -5, "0", 0.0]
+    )
+    def test_rejects_non_integral_or_non_positive(self, value):
+        from ha_garmin.client import _validate_positive_int
+
+        with pytest.raises(ValueError, match="x must be a positive integer"):
+            _validate_positive_int(value, "x")
+
+    async def test_url_uses_cleaned_id(self):
+        from ha_garmin.const import ADAPTIVE_TRAINING_PLAN_URL
+
+        client = GarminClient(_make_auth())
+        with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = {}
+            await client.get_adaptive_training_plan_by_id(1789148356.0)
+        mock_req.assert_awaited_once_with(
+            "GET", f"{ADAPTIVE_TRAINING_PLAN_URL}/1789148356"
+        )
+
+    async def test_fractional_id_rejected_without_request(self):
+        client = GarminClient(_make_auth())
+        with (
+            patch.object(client, "_request", new_callable=AsyncMock) as mock_req,
+            pytest.raises(ValueError),
+        ):
+            await client.get_adaptive_training_plan_by_id(1.9)
+        mock_req.assert_not_awaited()

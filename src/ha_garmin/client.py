@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import numbers
 import re
 import ssl
 from datetime import UTC, date, datetime, timedelta
@@ -218,13 +219,31 @@ class _PerActivityCache:
 
 
 def _validate_positive_int(value: Any, name: str) -> int:
-    """Validate a value is a positive integer suitable for a URL path segment."""
-    try:
+    """Validate a positive integer ID and return it as an int for a URL path.
+
+    Accepts ints, whole-number floats (``123.0``) and integer strings
+    (``"123"``). Rejects bools and values such as ``1.9`` that ``int()``
+    would silently truncate. Callers must use the returned value, so the
+    URL gets the clean integer rather than the raw argument.
+    """
+    error = f"{name} must be a positive integer, got {value!r}"
+    if isinstance(value, bool):
+        raise ValueError(error)
+    if isinstance(value, numbers.Integral):
         validated = int(value)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}") from e
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(error)
+        validated = int(value)
+    elif isinstance(value, str):
+        try:
+            validated = int(value.strip())
+        except ValueError as e:
+            raise ValueError(error) from e
+    else:
+        raise ValueError(error)
     if validated <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        raise ValueError(error)
     return validated
 
 
@@ -1434,7 +1453,7 @@ class GarminClient:
         Unlike the activities list, this response carries the e-bike
         (ANT+ LEV) fields such as eBikeBatteryRemaining.
         """
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{ACTIVITY_DETAILS_URL}/{activity_id}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
@@ -1512,7 +1531,7 @@ class GarminClient:
         self, activity_id: int, max_chart_size: int = 100, max_poly_size: int = 4000
     ) -> dict[str, Any]:
         """Get detailed activity information including polyline."""
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{ACTIVITY_DETAILS_URL}/{activity_id}/details"
         params = {"maxChartSize": max_chart_size, "maxPolylineSize": max_poly_size}
         data = await self._request("GET", url, params=params)
@@ -1526,7 +1545,7 @@ class GarminClient:
         Returns a list of HR zones with time spent in each zone.
         Example: [{"zoneName": "Zone 1", "secsInZone": 300}, ...]
         """
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{ACTIVITY_DETAILS_URL}/{activity_id}/hrTimeInZones"
         data = await self._request("GET", url)
         return data if isinstance(data, list) else []
@@ -1559,7 +1578,7 @@ class GarminClient:
         adaptive plan's own detail for that). See
         get_adaptive_training_plan_by_id for the fuller look-ahead.
         """
-        _validate_positive_int(year, "year")
+        year = _validate_positive_int(year, "year")
         if not 1 <= month <= 12:
             raise ValueError(f"month must be between 1 and 12, got: {month}")
         # Garmin's API is 0-indexed for month on this endpoint specifically.
@@ -1585,7 +1604,7 @@ class GarminClient:
         network calls -- kept in case it turns out to carry something
         those don't.
         """
-        _validate_positive_int(plan_id, "plan_id")
+        plan_id = _validate_positive_int(plan_id, "plan_id")
         url = f"{ADAPTIVE_TRAINING_PLAN_URL}/{plan_id}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
@@ -1606,7 +1625,7 @@ class GarminClient:
         a reason to support cookie-based auth turns up for something
         else too.
         """
-        _validate_positive_int(training_plan_id, "training_plan_id")
+        training_plan_id = _validate_positive_int(training_plan_id, "training_plan_id")
         params = {"trainingPlanId": training_plan_id}
         data = await self._request("GET", CALENDAR_EVENTS_URL, params=params)
         return data if isinstance(data, list) else []
@@ -1721,7 +1740,7 @@ class GarminClient:
         solarInputReadings (solarUtilization %, activityTimeGainMs) per reading.
         Empty dict for devices without solar charging.
         """
-        _validate_positive_int(device_id, "device_id")
+        device_id = _validate_positive_int(device_id, "device_id")
         if target_date is None:
             target_date = date.today()
 
@@ -1776,7 +1795,7 @@ class GarminClient:
 
     async def get_gear_defaults(self, user_profile_id: int) -> list[dict[str, Any]]:
         """Get default gear settings."""
-        _validate_positive_int(user_profile_id, "user_profile_id")
+        user_profile_id = _validate_positive_int(user_profile_id, "user_profile_id")
         url = f"{GEAR_DEFAULTS_URL}/{user_profile_id}/activityTypes"
         data = await self._request("GET", url)
         return data if isinstance(data, list) else []
@@ -1909,7 +1928,7 @@ class GarminClient:
 
     async def get_device_settings(self, device_id: int) -> dict[str, Any]:
         """Get device settings for a specific device."""
-        _validate_positive_int(device_id, "device_id")
+        device_id = _validate_positive_int(device_id, "device_id")
         url = f"{GARMIN_CONNECT_API}/device-service/deviceservice/device-info/settings/{device_id}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
@@ -2511,7 +2530,7 @@ class GarminClient:
         Returns:
             Raw file bytes.
         """
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         fmt = file_format.lower()
         allowed_formats = {"fit", "original", "tcx", "gpx", "kml", "csv"}
         if fmt not in allowed_formats:
@@ -2639,7 +2658,7 @@ class GarminClient:
             activity_id: ID of the activity
         """
         _validate_uuid(gear_uuid, "gear_uuid")
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{GEAR_LINK_URL}/{gear_uuid}/activity/{activity_id}"
         return await self._put_request(url)
 

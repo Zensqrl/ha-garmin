@@ -1090,11 +1090,10 @@ class GarminAuth:
             if r.status_code == 429:
                 raise GarminRateLimitError("DI token exchange rate limited")
             if not r.ok:
+                # Log only the status: the error body from the token endpoint
+                # isn't needed to diagnose a failed exchange.
                 _LOGGER.debug(
-                    "DI exchange failed for %s: %s %s",
-                    client_id,
-                    r.status_code,
-                    r.text[:200],
+                    "DI exchange failed for %s: HTTP %s", client_id, r.status_code
                 )
                 continue
             try:
