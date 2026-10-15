@@ -279,6 +279,16 @@ def _sanitize_filename(name: str) -> str:
     return re.sub(r'[\r\n"\\]', "_", name)
 
 
+def _upload_messages(result: dict[str, Any], *keys: str) -> list[str]:
+    """Collect the message texts from an upload's detailedImportResult lists."""
+    return [
+        msg.get("content", "Unknown error")
+        for key in keys
+        for entry in result.get(key) or []
+        for msg in entry.get("messages", [])
+    ]
+
+
 _LOGGER = logging.getLogger(__name__)
 
 # Essential keys to keep when trimming activity data
@@ -2629,21 +2639,22 @@ class GarminClient:
             ) from None
 
         # 400 with uploadId means file was accepted but has validation issues
-        if response.status_code == 400 and (body.get("detailedImportResult") or {}).get(
-            "uploadId"
-        ):
-            _LOGGER.warning("Upload accepted with warnings: %s", body)
+        result = body.get("detailedImportResult") or {}
+        if response.status_code == 400 and result.get("uploadId"):
+            # Log only Garmin's messages: the full response also carries the
+            # account's user ID and upload IDs, and warnings land in HA logs.
+            _LOGGER.warning(
+                "Upload accepted with warnings: %s",
+                "; ".join(_upload_messages(result, "failures", "successes"))
+                or "no details",
+            )
             return body
 
         if response.status_code not in (200, 201, 202):
-            result = body.get("detailedImportResult") or {}
-            failures = result.get("failures") or []
-            if failures:
-                messages = []
-                for failure in failures:
-                    for msg in failure.get("messages", []):
-                        messages.append(msg.get("content", "Unknown error"))
-                error_msg = "; ".join(messages) if messages else "Unknown error"
+            if result.get("failures"):
+                error_msg = (
+                    "; ".join(_upload_messages(result, "failures")) or "Unknown error"
+                )
                 raise GarminAPIError(f"Upload failed: {error_msg}")
             raise GarminAPIError(f"Upload failed: {response.status_code}")
         return body

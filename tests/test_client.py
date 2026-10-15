@@ -2409,6 +2409,57 @@ class TestGarminClient:
             )
 
 
+class TestUploadActivityLogging:
+    """upload_activity() must not log Garmin's full upload response."""
+
+    _RESULT = {
+        "detailedImportResult": {
+            "uploadId": 123456789,
+            "uploadUuid": {"uuid": "secret-upload-uuid"},
+            "owner": 987654321,
+            "fileName": "ride.fit",
+            "successes": [],
+            "failures": [
+                {
+                    "internalId": 555,
+                    "messages": [{"code": 202, "content": "Duplicate Activity."}],
+                }
+            ],
+        }
+    }
+
+    async def test_warning_logs_messages_not_body(self, tmp_path, caplog):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b"fit")
+        client = GarminClient(_make_auth())
+        with (
+            patch("requests.post", return_value=_mock_response(self._RESULT, 400)),
+            caplog.at_level("WARNING", logger="ha_garmin.client"),
+        ):
+            body = await client.upload_activity(str(fit))
+        assert body == self._RESULT
+        assert "Upload accepted with warnings: Duplicate Activity." in caplog.text
+        assert "987654321" not in caplog.text
+        assert "secret-upload-uuid" not in caplog.text
+
+    async def test_failure_error_lists_failure_messages(self, tmp_path):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b"fit")
+        client = GarminClient(_make_auth())
+        result = {
+            "detailedImportResult": {
+                "failures": [
+                    {"messages": [{"content": "Bad file"}, {"content": "Really bad"}]}
+                ]
+            }
+        }
+        with (
+            patch("requests.post", return_value=_mock_response(result, 500)),
+            pytest.raises(GarminAPIError, match="Upload failed: Bad file; Really bad"),
+        ):
+            await client.upload_activity(str(fit))
+
+
 class TestSecurityAuditHardening:
     """Regression tests for the python-garminconnect audit cross-check."""
 
