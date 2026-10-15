@@ -61,6 +61,8 @@ from .const import (
     USER_SETTINGS_URL,
     USER_SUMMARY_URL,
     WEIGHT_LATEST_URL,
+    WORKOUT_SCHEDULE_URL,
+    WORKOUT_URL,
     WORKOUTS_URL,
 )
 from .exceptions import (
@@ -2729,6 +2731,66 @@ class GarminClient:
         activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{GEAR_LINK_URL}/{gear_uuid}/activity/{activity_id}"
         return await self._put_request(url)
+
+    async def create_workout(self, workout: dict[str, Any]) -> dict[str, Any]:
+        """Create a workout in the workout library.
+
+        Args:
+            workout: Garmin workout JSON (workoutName, sportType, workoutSegments)
+
+        Returns:
+            The created workout, including its new workoutId
+        """
+        if not isinstance(workout, dict):
+            raise ValueError("workout must be a JSON object")
+        return await self._post_request(WORKOUT_URL, workout)
+
+    async def update_workout(
+        self, workout_id: int, workout: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Replace a workout in place; its id and calendar schedules are kept.
+
+        Args:
+            workout_id: ID of the workout to replace
+            workout: Complete Garmin workout JSON (workoutId is forced to match)
+        """
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        if not isinstance(workout, dict):
+            raise ValueError("workout must be a JSON object")
+        url = f"{WORKOUT_URL}/{workout_id}"
+        return await self._put_request(url, workout | {"workoutId": workout_id})
+
+    async def delete_workout(self, workout_id: int) -> dict[str, Any]:
+        """Delete a workout from the library (also drops its schedules)."""
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        return await self._delete_request(f"{WORKOUT_URL}/{workout_id}")
+
+    async def schedule_workout(
+        self, workout_id: int, schedule_date: date | str
+    ) -> dict[str, Any]:
+        """Put a library workout on the training calendar.
+
+        Args:
+            workout_id: ID of the workout to schedule
+            schedule_date: Calendar date (date or YYYY-MM-DD)
+
+        Returns:
+            The schedule entry; its id is what unschedule_workout takes
+        """
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        if isinstance(schedule_date, str):
+            schedule_date = date.fromisoformat(schedule_date)
+        url = f"{WORKOUT_SCHEDULE_URL}/{workout_id}"
+        return await self._post_request(url, {"date": schedule_date.isoformat()})
+
+    async def unschedule_workout(self, scheduled_workout_id: int) -> dict[str, Any]:
+        """Remove a workout from the calendar without deleting it."""
+        scheduled_workout_id = _validate_positive_int(
+            scheduled_workout_id, "scheduled_workout_id"
+        )
+        return await self._delete_request(
+            f"{WORKOUT_SCHEDULE_URL}/{scheduled_workout_id}"
+        )
 
     # ========== Multi-Coordinator Fetch Methods ==========
 

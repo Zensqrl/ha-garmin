@@ -2763,3 +2763,88 @@ class TestValidatePositiveInt:
         ):
             await client.get_adaptive_training_plan_by_id(1.9)
         mock_req.assert_not_awaited()
+
+
+class TestWorkoutWrites:
+    """Workout create/update/delete/schedule hit the workout-service endpoints."""
+
+    async def test_create_workout_posts_json(self):
+        from ha_garmin.const import WORKOUT_URL
+
+        client = GarminClient(_make_auth())
+        client._post_request = AsyncMock(return_value={"workoutId": 42})
+        workout = {"workoutName": "Easy", "sportType": {"sportTypeKey": "running"}}
+        assert await client.create_workout(workout) == {"workoutId": 42}
+        client._post_request.assert_awaited_once_with(WORKOUT_URL, workout)
+
+    async def test_create_workout_rejects_non_object(self):
+        client = GarminClient(_make_auth())
+        client._post_request = AsyncMock()
+        with pytest.raises(ValueError, match="JSON object"):
+            await client.create_workout([{"workoutName": "x"}])
+        client._post_request.assert_not_awaited()
+
+    async def test_update_workout_forces_id(self):
+        from ha_garmin.const import WORKOUT_URL
+
+        client = GarminClient(_make_auth())
+        client._put_request = AsyncMock(return_value={})
+        await client.update_workout("42", {"workoutId": 1, "workoutName": "New"})
+        client._put_request.assert_awaited_once_with(
+            f"{WORKOUT_URL}/42", {"workoutId": 42, "workoutName": "New"}
+        )
+
+    async def test_delete_workout(self):
+        from ha_garmin.const import WORKOUT_URL
+
+        client = GarminClient(_make_auth())
+        client._delete_request = AsyncMock(return_value={})
+        await client.delete_workout(42)
+        client._delete_request.assert_awaited_once_with(f"{WORKOUT_URL}/42")
+
+    @pytest.mark.parametrize("when", [date(2026, 3, 20), "2026-03-20"])
+    async def test_schedule_workout(self, when):
+        from ha_garmin.const import WORKOUT_SCHEDULE_URL
+
+        client = GarminClient(_make_auth())
+        client._post_request = AsyncMock(return_value={"workoutScheduleId": 7})
+        result = await client.schedule_workout(42, when)
+        assert result == {"workoutScheduleId": 7}
+        client._post_request.assert_awaited_once_with(
+            f"{WORKOUT_SCHEDULE_URL}/42", {"date": "2026-03-20"}
+        )
+
+    async def test_schedule_workout_rejects_bad_date(self):
+        client = GarminClient(_make_auth())
+        client._post_request = AsyncMock()
+        with pytest.raises(ValueError):
+            await client.schedule_workout(42, "20-03-2026")
+        client._post_request.assert_not_awaited()
+
+    async def test_unschedule_workout(self):
+        from ha_garmin.const import WORKOUT_SCHEDULE_URL
+
+        client = GarminClient(_make_auth())
+        client._delete_request = AsyncMock(return_value={})
+        await client.unschedule_workout(7)
+        client._delete_request.assert_awaited_once_with(f"{WORKOUT_SCHEDULE_URL}/7")
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda c: c.delete_workout(1.5),
+            lambda c: c.update_workout(0, {}),
+            lambda c: c.schedule_workout("abc", "2026-03-20"),
+            lambda c: c.unschedule_workout(-1),
+        ],
+    )
+    async def test_invalid_ids_rejected_without_request(self, call):
+        client = GarminClient(_make_auth())
+        client._request = AsyncMock()
+        client._post_request = AsyncMock()
+        client._put_request = AsyncMock()
+        client._delete_request = AsyncMock()
+        with pytest.raises(ValueError, match="positive integer"):
+            await call(client)
+        for mock in (client._post_request, client._put_request, client._delete_request):
+            mock.assert_not_awaited()
