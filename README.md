@@ -48,11 +48,13 @@ if not auth.load_session(".garmin_tokens.json"):
         auth.complete_mfa(mfa_code)
     auth.save_session(".garmin_tokens.json")
 
-client = GarminClient(auth)
+# timezone: fallback zone for "today" until the Garmin account's own UTC
+# offset is learned from the first daily summary (defaults to the system zone).
+client = GarminClient(auth, timezone="Europe/Amsterdam")
 
 
 async def fetch_all():
-    today = date.today()
+    today = client.today()  # Garmin calendar date, independent of the process zone
     core_data     = await client.fetch_core_data(today)      # Steps, HR, sleep, stress
     body_data     = await client.fetch_body_data(today)      # Weight, body composition, fitness age
     activity_data = await client.fetch_activity_data(today)  # Activities, workouts, training calendar
