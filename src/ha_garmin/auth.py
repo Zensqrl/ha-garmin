@@ -42,6 +42,14 @@ from .models import AuthResult
 
 _LOGGER = logging.getLogger(__name__)
 
+# A 401 from the API tier means the token itself is refused, but a 403 can
+# also mean Garmin is blocking the client or network making the call, in
+# which case the token may be fine and the "token rejected" wording misleads.
+_API_REJECTION_HINT = (
+    "a 403 here can also mean Garmin is blocking this client or network "
+    "rather than rejecting the token"
+)
+
 # Detect ~username expansion that would point into another user's home directory.
 _OTHER_USER_HOME_RE = re.compile(r"^~[^/\\]")
 
@@ -77,9 +85,13 @@ def token_file_path(path: str | Path) -> Path:
     # ~/.garminconnect -> /attacker/dir). O_NOFOLLOW on the final open()
     # only covers the last component; an intermediate symlinked directory
     # would still redirect load/save into an attacker-controlled tree.
+    # Root-owned symlinks (e.g. /home -> var/home on Fedora Silverblue and
+    # FreeBSD) are allowed: an unprivileged attacker cannot plant one.
     for check_path in (token_path, *token_path.parents):
         try:
-            if check_path.is_symlink():
+            if check_path.is_symlink() and not (
+                os.name == "posix" and check_path.lstat().st_uid == 0
+            ):
                 raise ValueError(f"Token path must not be a symlink: {path_str!r}")
         except OSError as e:
             raise ValueError(
@@ -222,6 +234,10 @@ class GarminAuth:
         # is held on this instance. Prevents interleaving another login on the
         # same instance while MFA is pending.
         self._mfa_pending = False
+        # HTTP status of the last API-tier rejection seen by _verify_token(),
+        # so callers can tell a 401 (token refused) from a 403 (possibly a
+        # client/network block) when they report it.
+        self._last_rejection_status: int | None = None
 
     @property
     def is_authenticated(self) -> bool:
@@ -276,6 +292,7 @@ class GarminAuth:
         definitive auth rejection (401/403) returns False, so a transient
         network error or 5xx never blocks an otherwise-working login.
         """
+        self._last_rejection_status = None
         if not self.is_authenticated:
             return False
         try:
@@ -292,9 +309,24 @@ class GarminAuth:
             )
             return True
         if r.status_code in (401, 403):
+            self._last_rejection_status = r.status_code
             _LOGGER.warning("Token rejected by API tier: HTTP %s", r.status_code)
             return False
         return True
+
+    def _token_rejected_message(self, prefix: str) -> str:
+        """Describe the last _verify_token() rejection, with its HTTP status.
+
+        A 403 gets a hint that the cause may be a client/network block rather
+        than the token, so users don't chase a token problem that isn't one.
+        """
+        status = self._last_rejection_status
+        if status is None:
+            return prefix
+        message = f"{prefix} (HTTP {status})"
+        if status == 403:
+            message += f"; {_API_REJECTION_HINT}"
+        return message
 
     def _token_expires_soon(self) -> bool:
         """Check if the active token will expire within 15 minutes."""
@@ -370,6 +402,10 @@ class GarminAuth:
 
         last_err: Exception | None = None
         rate_limited_count = 0
+        # Earlier strategies failing is expected (later ones usually work), so
+        # per-strategy failures are logged at debug and summarized in the
+        # final error when every strategy fails.
+        failures: list[str] = []
 
         for name, run in strategies:
             try:
@@ -379,42 +415,45 @@ class GarminAuth:
                 # region specific). Verify before accepting; otherwise fall
                 # through to the next strategy.
                 if not self._verify_token():
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "%s obtained a token the API rejected; trying next strategy",
                         name,
                     )
+                    last_err = GarminAPIError(
+                        self._token_rejected_message(
+                            f"{name}: token rejected by API tier"
+                        )
+                    )
+                    failures.append(f"{name}: token rejected")
                     self._clear_auth_state()
-                    last_err = GarminAPIError(f"{name}: token rejected by API tier")
                     continue
                 return result
             except (GarminAuthError, GarminMFARequired):
                 # Bad credentials or MFA needed — stop immediately.
                 raise
             except GarminRateLimitError as e:
-                _LOGGER.warning(
-                    "%s returned 429: %s", name, _sanitize_exception_text(e)
-                )
+                _LOGGER.debug("%s returned 429: %s", name, _sanitize_exception_text(e))
                 rate_limited_count += 1
                 last_err = e
+                failures.append(f"{name}: 429")
                 continue
             except Exception as e:
-                _LOGGER.warning("%s failed: %s", name, _sanitize_exception_text(e))
+                _LOGGER.debug("%s failed: %s", name, _sanitize_exception_text(e))
                 last_err = e
+                failures.append(f"{name}: {type(e).__name__}")
                 continue
 
+        summary = "; ".join(failures)
         if rate_limited_count == len(strategies):
             raise GarminRateLimitError(
                 "All login strategies rate limited (429). "
-                "Try again later or check your IP/network."
+                "Garmin may be blocking this client or network rather than "
+                "rate limiting; try again later or from another network."
             )
         raise GarminAPIError(
-            "All login strategies exhausted: "
+            f"All login strategies exhausted ({summary}): "
             + (_sanitize_exception_text(last_err) if last_err else "no strategies ran")
         )
-
-    # ------------------------------------------------------------------ #
-    #  STRATEGY 1 — Mobile iOS + curl_cffi (TLS fingerprint rotation)     #
-    # ------------------------------------------------------------------ #
 
     def _mobile_login_cffi(self, email: str, password: str) -> AuthResult:
         """Mobile login with curl_cffi TLS fingerprint rotation.
@@ -492,7 +531,8 @@ class GarminAuth:
 
         if r.status_code == 429:
             raise GarminRateLimitError(
-                "Mobile login returned 429 — IP rate limited by Garmin"
+                "Mobile login returned 429 — rate limited or blocked by Garmin "
+                "(can be triggered by the client fingerprint, not only the IP)"
             )
 
         try:
@@ -934,11 +974,14 @@ class GarminAuth:
             self._complete_mfa(mfa_code)
             # The MFA session is tied to one strategy, so there's no fall-through
             # here — but still fail loudly rather than store a token the API tier
-            # rejects (see _verify_token / issue context).
+            # rejects (see _verify_token).
             if not self._verify_token():
+                message = self._token_rejected_message(
+                    "Token rejected by API tier after MFA"
+                )
                 self._clear_auth_state()
                 self._clear_mfa_state()
-                raise GarminAuthError("Token rejected by API tier after MFA")
+                raise GarminAuthError(message)
             return AuthResult(success=True)
         finally:
             # Always clear the pending MFA flag and per-attempt state so a new
@@ -1088,11 +1131,10 @@ class GarminAuth:
             if r.status_code == 429:
                 raise GarminRateLimitError("DI token exchange rate limited")
             if not r.ok:
+                # Log only the status: the error body from the token endpoint
+                # isn't needed to diagnose a failed exchange.
                 _LOGGER.debug(
-                    "DI exchange failed for %s: %s %s",
-                    client_id,
-                    r.status_code,
-                    r.text[:200],
+                    "DI exchange failed for %s: HTTP %s", client_id, r.status_code
                 )
                 continue
             try:

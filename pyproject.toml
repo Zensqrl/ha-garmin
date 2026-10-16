@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-garmin"
-version = "0.1.48+zs1"
+version = "0.1.52+zs1"
 description = "Python client for Garmin Connect API"
 readme = "README.md"
 license = {text = "MIT"}
@@ -30,6 +30,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "curl_cffi>=0.7.4",
     "requests>=2.28.0",
+    "tzdata; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

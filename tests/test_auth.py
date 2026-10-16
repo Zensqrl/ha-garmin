@@ -3,6 +3,7 @@
 import os
 import stat
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -76,6 +77,67 @@ class TestGarminAuth:
         """No token at all cannot be valid."""
         auth = GarminAuth()
         assert auth._verify_token() is False
+
+    @pytest.mark.parametrize(("status", "hinted"), [(401, False), (403, True)])
+    async def test_rejected_strategy_error_names_status(self, status, hinted):
+        """The login error carries the HTTP status; only a 403 gets the
+        client/network-block hint, since a 401 really is a refused token.
+        """
+        from ha_garmin.models import AuthResult
+
+        auth = GarminAuth()
+
+        def strategy(_email, _password):
+            auth.di_token = "tok"
+            return AuthResult(success=True)
+
+        with (
+            patch.object(auth, "_mobile_login_cffi", side_effect=strategy),
+            patch.object(auth, "_mobile_login_requests", side_effect=strategy),
+            patch.object(auth, "_widget_web_login", side_effect=strategy),
+            patch.object(auth, "_portal_web_login_cffi", side_effect=strategy),
+            patch.object(auth, "_portal_web_login_requests", side_effect=strategy),
+            patch(
+                "ha_garmin.auth.cffi_requests.get",
+                return_value=MagicMock(status_code=status),
+            ),
+            pytest.raises(GarminAPIError) as excinfo,
+        ):
+            auth.login("e@x.com", "pw")
+        message = str(excinfo.value)
+        assert f"token rejected by API tier (HTTP {status})" in message
+        assert ("client or network" in message) is hinted
+
+    async def test_rejected_mfa_token_error_hints_on_403(self):
+        """complete_mfa() reports a 403 rejection with the same hint."""
+        auth = GarminAuth()
+        auth._mfa_session = MagicMock()  # an MFA login is pending
+
+        def complete(_code):
+            auth.di_token = "tok"
+
+        with (
+            patch.object(auth, "_complete_mfa", side_effect=complete),
+            patch(
+                "ha_garmin.auth.cffi_requests.get",
+                return_value=MagicMock(status_code=403),
+            ),
+            pytest.raises(GarminAuthError, match=r"HTTP 403.*client or network"),
+        ):
+            auth.complete_mfa("123456")
+
+    async def test_verify_token_success_clears_last_rejection(self):
+        """An accepted token must not keep an earlier rejection's status."""
+        auth = GarminAuth()
+        auth.di_token = "tok"
+        auth._last_rejection_status = 403
+        with patch(
+            "ha_garmin.auth.cffi_requests.get",
+            return_value=MagicMock(status_code=200),
+        ):
+            assert auth._verify_token() is True
+        assert auth._last_rejection_status is None
+        assert auth._token_rejected_message("x") == "x"
 
     async def test_login_falls_through_rejected_token(self):
         """A strategy whose token the API rejects must not win the chain;
@@ -374,6 +436,29 @@ class TestGarminAuth:
         result = auth.load_session(str(symlink_file))
         assert result is False
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks only")
+    async def test_save_session_allows_root_owned_symlinked_parent(self, tmp_path):
+        """A root-owned symlink (e.g. /home -> var/home) is not attacker-plantable."""
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        symlink_dir = tmp_path / "link"
+        symlink_dir.symlink_to(real_dir)
+        real_lstat = Path.lstat
+
+        def fake_lstat(self):
+            st = real_lstat(self)
+            if self == symlink_dir:
+                return os.stat_result((st.st_mode, *st[1:4], 0, *st[5:]))
+            return st
+
+        auth = GarminAuth()
+        auth.di_token = "di_abc"
+        auth.di_refresh_token = "di_refresh"
+        auth.di_client_id = "CID"
+        with patch.object(Path, "lstat", fake_lstat):
+            auth.save_session(str(symlink_dir / "tokens.json"))
+        assert (real_dir / "tokens.json").exists()
+
     async def test_refresh_session_holds_token_lock(self):
         """refresh_session must execute the refresh while holding the token lock."""
         auth = GarminAuth()
@@ -506,7 +591,7 @@ class TestSecurityAuditHardening:
             patch.object(auth, "_widget_web_login", side_effect=boom),
             patch.object(auth, "_portal_web_login_cffi", side_effect=boom),
             patch.object(auth, "_portal_web_login_requests", side_effect=boom),
-            caplog.at_level("WARNING", logger="ha_garmin.auth"),
+            caplog.at_level("DEBUG", logger="ha_garmin.auth"),
             pytest.raises(GarminAPIError, match="exhausted") as exc_info,
         ):
             auth.login("u@x.com", "pw")
@@ -514,6 +599,23 @@ class TestSecurityAuditHardening:
         assert "ST-CANARY-123" not in caplog.text
         assert "ST-CANARY-123" not in str(exc_info.value)
         assert "ticket=<redacted>" in caplog.text
+
+    def test_failed_strategies_log_at_debug_and_summarize(self, caplog):
+        """A strategy failing is expected; only the final error reports them."""
+        auth = GarminAuth()
+        boom = ConnectionError("down")
+        with (
+            patch.object(auth, "_mobile_login_cffi", side_effect=boom),
+            patch.object(auth, "_mobile_login_requests", side_effect=boom),
+            patch.object(auth, "_widget_web_login", side_effect=boom),
+            patch.object(auth, "_portal_web_login_cffi", side_effect=boom),
+            patch.object(auth, "_portal_web_login_requests", side_effect=boom),
+            caplog.at_level("WARNING", logger="ha_garmin.auth"),
+            pytest.raises(GarminAPIError, match="ConnectionError; ") as exc_info,
+        ):
+            auth.login("u@x.com", "pw")
+        assert caplog.text == ""
+        assert "mobile+cffi: ConnectionError" in str(exc_info.value)
 
     def test_sanitize_exception_text_redacts_query_values(self):
         from ha_garmin.auth import _sanitize_exception_text
@@ -523,3 +625,17 @@ class TestSecurityAuditHardening:
         assert "bar" not in out
         assert "ticket=<redacted>" in out
         assert "foo=<redacted>" in out
+
+
+def test_di_exchange_failure_log_omits_response_body(caplog):
+    """A failed DI exchange logs the status, never the token endpoint's body."""
+    auth = GarminAuth()
+    failed = MagicMock(ok=False, status_code=400, text="ST-CANARY-TICKET-123 detail")
+    with (
+        patch("ha_garmin.auth._http_post", return_value=failed),
+        caplog.at_level("DEBUG", logger="ha_garmin.auth"),
+        pytest.raises(GarminAuthError),
+    ):
+        auth._exchange_service_ticket("ST-CANARY-TICKET-123")
+    assert "HTTP 400" in caplog.text
+    assert "ST-CANARY-TICKET-123" not in caplog.text
