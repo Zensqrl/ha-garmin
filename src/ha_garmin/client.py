@@ -26,6 +26,7 @@ from .const import (
     BADGES_URL,
     BLOOD_PRESSURE_SET_URL,
     BLOOD_PRESSURE_URL,
+    BODY_COMPOSITION_URL,
     CALENDAR_EVENTS_URL,
     CALENDAR_URL,
     DAILY_STEPS_URL,
@@ -1526,28 +1527,50 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get the most recent weigh-in as of target_date (weight, BMI, body fat).
 
-        Uses weight/latest like the web app, so a weigh-in of any age is
-        returned and the sensors never go blank between measurements.
+        Read from weight/range over the last 30 days. When that window has no
+        weigh-in, the same response's previousDateWeight is the latest one
+        before it, as a complete record (bodyWater included), so an old
+        weigh-in has the same fields as a recent one and the sensors never go
+        blank. weight/latest is only a last resort.
         """
         if target_date is None:
             target_date = self.today()
 
+        start = (target_date - timedelta(days=30)).isoformat()
+        url = f"{BODY_COMPOSITION_URL}/{start}/{target_date.isoformat()}"
+        data = await self._request("GET", url)
+        if isinstance(data, dict):
+            latest = max(
+                (
+                    s["latestWeight"]
+                    for s in data.get("dailyWeightSummaries") or []
+                    if (s.get("latestWeight") or {}).get("weight") is not None
+                ),
+                key=lambda m: m.get("calendarDate", ""),
+                default=None,
+            )
+            if latest:
+                return _sanitize_body_composition(latest)
+            previous = data.get("previousDateWeight") or {}
+            if previous.get("weight") is not None:
+                return _sanitize_body_composition(previous)
+
         params = {"date": target_date.isoformat(), "ignorePriority": "true"}
-        data = await self._request("GET", WEIGHT_LATEST_URL, params=params)
-        if not isinstance(data, dict) or data.get("weight") is None:
+        latest_data = await self._request("GET", WEIGHT_LATEST_URL, params=params)
+        if not isinstance(latest_data, dict) or latest_data.get("weight") is None:
             return {}
-        if "samplePk" not in data and "version" in data:
-            data = {**data, "samplePk": data["version"]}
+        if "samplePk" not in latest_data and "version" in latest_data:
+            latest_data = {**latest_data, "samplePk": latest_data["version"]}
         # "date" is the weigh-in's local wall-clock time as epoch ms.
-        local_ms = data.get("date")
-        if isinstance(local_ms, (int, float)) and "calendarDate" not in data:
-            data = {
-                **data,
+        local_ms = latest_data.get("date")
+        if isinstance(local_ms, (int, float)) and "calendarDate" not in latest_data:
+            latest_data = {
+                **latest_data,
                 "calendarDate": datetime.fromtimestamp(local_ms / 1000, UTC)
                 .date()
                 .isoformat(),
             }
-        return _sanitize_body_composition(data)
+        return _sanitize_body_composition(latest_data)
 
     async def get_activities(
         self, start: int = 0, limit: int = 10

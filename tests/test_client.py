@@ -1640,26 +1640,75 @@ class TestGarminClient:
         with pytest.raises(GarminTLSError):
             await client._safe_call(failing)
 
-    async def test_get_body_composition_uses_latest_weigh_in(self):
-        """Body composition is the latest weigh-in, as the web app reads it."""
+    async def test_get_body_composition_newest_weigh_in_from_range(self):
+        """The usual case: one weight/range call, newest weigh-in wins."""
         client = GarminClient(_make_auth())
-        # "date" is local wall-clock ms: 2026-10-16T13:02:54 local.
-        payload = {"date": 1792146174277, "weight": 87910.0, "bmi": 26.0}
-        client._request = AsyncMock(return_value=payload)
+        client._request = AsyncMock(
+            return_value={
+                "dailyWeightSummaries": [
+                    {"latestWeight": {"calendarDate": "2026-10-01", "weight": 85000.0}},
+                    {
+                        "latestWeight": {
+                            "calendarDate": "2026-10-14",
+                            "weight": 87000.0,
+                            "bodyWater": 56.1,
+                        }
+                    },
+                ],
+                "previousDateWeight": {"calendarDate": "2026-09-01", "weight": 1.0},
+            }
+        )
 
         result = await client.get_body_composition(date(2026, 10, 16))
 
-        assert result["weight"] == 87910.0
-        assert result["bmi"] == 26.0
-        assert result["calendarDate"] == "2026-10-16"
-        assert client._request.call_args.kwargs["params"] == {
-            "date": "2026-10-16",
-            "ignorePriority": "true",
+        assert result["weight"] == 87000.0
+        assert result["bodyWater"] == 56.1
+        client._request.assert_awaited_once()
+        assert client._request.call_args.args[1].endswith("/2026-09-16/2026-10-16")
+
+    async def test_get_body_composition_old_weigh_in_keeps_body_water(self):
+        """No weigh-in in 30 days: previousDateWeight is the complete record."""
+        client = GarminClient(_make_auth())
+        previous = {
+            "calendarDate": "2026-09-13",
+            "weight": 80000.0,
+            "bodyFat": 22.0,
+            "bodyWater": 57.3,
+            "sourceType": "INDEX_SCALE",
         }
+        client._request = AsyncMock(
+            return_value={"dailyWeightSummaries": [], "previousDateWeight": previous}
+        )
+
+        result = await client.get_body_composition(date(2026, 10, 15))
+
+        assert result == previous
+        client._request.assert_awaited_once()
+
+    async def test_get_body_composition_last_resort_is_weight_latest(self):
+        """No weigh-in in or before the window: weight/latest, dated from its ms."""
+        from ha_garmin.const import WEIGHT_LATEST_URL
+
+        client = GarminClient(_make_auth())
+        latest = {"date": 1789286400000, "version": 7, "weight": 80000.0}
+
+        async def fake_request(method, url, params=None):
+            return latest if url == WEIGHT_LATEST_URL else {"dailyWeightSummaries": []}
+
+        client._request = fake_request
+        result = await client.get_body_composition(date(2026, 10, 15))
+
+        assert result["weight"] == 80000.0
+        assert result["calendarDate"] == "2026-09-13"
+        assert result["samplePk"] == 7
 
     async def test_get_body_composition_empty_without_weigh_in(self):
         client = GarminClient(_make_auth())
-        client._request = AsyncMock(return_value={"weight": None})
+
+        async def fake_request(method, url, params=None):
+            return {"weight": None} if "latest" in url else {}
+
+        client._request = fake_request
         assert await client.get_body_composition() == {}
 
     @pytest.mark.parametrize(
@@ -1678,9 +1727,15 @@ class TestGarminClient:
         client = GarminClient(auth)
 
         payload = {
-            "calendarDate": "2026-04-03",
-            "weight": 87000.0,
-            "metabolicAge": raw,
+            "dailyWeightSummaries": [
+                {
+                    "latestWeight": {
+                        "calendarDate": "2026-04-03",
+                        "weight": 87000.0,
+                        "metabolicAge": raw,
+                    },
+                },
+            ],
         }
 
         with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
