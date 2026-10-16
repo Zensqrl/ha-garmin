@@ -71,11 +71,13 @@ if not auth.load_session(".garmin_tokens.json"):
         auth.complete_mfa(mfa_code)
     auth.save_session(".garmin_tokens.json")
 
-client = GarminClient(auth)
+# timezone: fallback zone for "today" until the Garmin account's own UTC
+# offset is learned from the first daily summary (defaults to the system zone).
+client = GarminClient(auth, timezone="Europe/Amsterdam")
 
 
 async def fetch_all():
-    today = date.today()
+    today = client.today()  # Garmin calendar date, independent of the process zone
     core_data     = await client.fetch_core_data(today)      # Steps, HR, sleep, stress
     body_data     = await client.fetch_body_data(today)      # Weight, body composition, fitness age
     activity_data = await client.fetch_activity_data(today)  # Activities, workouts, training calendar
@@ -157,12 +159,12 @@ Optimized methods that group related API calls for Home Assistant coordinators:
 
 | Method | API Calls | Data Returned |
 | ------ | --------- | ------------- |
-| `fetch_core_data()` | 4 | Steps, distance, calories, HR, stress, sleep, body battery, SPO2, intraday Body Battery + stress timelines |
+| `fetch_core_data()` | 4 | Steps, distance, calories, HR, stress, sleep, skin temperature change, body battery, SPO2, intraday Body Battery + stress timelines |
 | `fetch_body_data()` | 3 | Weight, BMI, body fat, hydration, fitness age |
-| `fetch_activity_data()` | 6+ | Activities, workouts, HR zones, polylines, training calendar (scheduled workouts) |
-| `fetch_training_data()` | 7 | Training readiness, status, HRV, lactate, endurance/hill scores |
-| `fetch_goals_data()` | 4 | Goals (active/future/history), badges, user level |
-| `fetch_gear_data()` | 6+ | Gear items, stats, device alarms, solar intensity (daily avg + gain), devices, last sync, paired sensors |
+| `fetch_activity_data()` | 7+ | Activities, workouts, HR zones, polylines, training calendar (scheduled workouts), upcoming events and the plan goal event |
+| `fetch_training_data()` | 8+ | Training readiness, status, VO2 Max (running and cycling), heat/altitude acclimation, HRV, lactate, endurance/hill scores, power-to-weight |
+| `fetch_goals_data()` | 5 | Goals (active/future/history), badges, user level, lifetime totals |
+| `fetch_gear_data()` | 6+ | Gear items with usage totals and notes (gear v2, no per-item stats calls), device alarms, solar intensity (daily avg + gain), devices, last sync, paired sensors |
 | `fetch_blood_pressure_data()` | 1 | Blood pressure measurements |
 | `fetch_menstrual_data()` | 2 | Menstrual cycle data |
 | `fetch_nutrition_data()` | 1 | Nutrition log: consumed macros, goals, per-meal breakdown |
@@ -181,6 +183,11 @@ Methods for logging data back to Garmin Connect, suitable for Home Assistant ser
 | `upload_activity(file_path)` | Upload a FIT / GPX / TCX file |
 | `set_active_gear(activity_type, setting, gear_uuid)` | Set default gear for an activity type |
 | `add_gear_to_activity(gear_uuid, activity_id)` | Associate gear with an activity |
+| `create_workout(workout)` | Create a workout from Garmin workout JSON; returns it with `workoutId` |
+| `update_workout(workout_id, workout)` | Replace a workout in place (keeps its id and schedules) |
+| `delete_workout(workout_id)` | Delete a workout from the library |
+| `schedule_workout(workout_id, date)` | Put a workout on the training calendar |
+| `unschedule_workout(scheduled_workout_id)` | Remove a workout from the calendar (keeps the workout) |
 
 ### Nutrition logging
 
@@ -203,18 +210,21 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | Method | Description |
 | ------ | ----------- |
 | `get_user_profile()` | User profile info |
+| `get_user_settings()` | Profile settings (`userData`, incl. VO2 Max running/cycling) |
 | `get_daily_steps()` | Steps for date range |
-| `get_body_composition()` | Weight, BMI, body fat |
+| `get_body_composition()` | Latest weigh-in: weight, BMI, body fat |
 | `get_fitness_age()` | Fitness age metrics |
 | `get_hydration_data()` | Daily hydration |
 | `get_daily_stress(target_date)` | Raw intraday stress + Body Battery payload for any date (defaults to today) |
 | `get_activities()` | Most recent activities (newest first, no date filter) |
 | `get_activity(activity_id)` | Single activity summary (includes e-bike fields) |
 | `get_activity_details()` | Detailed activity with polyline |
+| `get_activity_connect_iq_display_info()` | Field definitions of the Connect IQ apps used in an activity; values are in `get_activity()['connectIQMeasurements']`, joined by `fetch_activity_data()` into `lastActivity['connectIQFields']` |
 | `get_activity_hr_in_timezones()` | HR time in zones |
 | `download_activity(activity_id, file_format)` | Download activity file (fit/original/tcx/gpx/kml/csv) |
 | `get_workouts()` | Workout library (created/saved workouts, not when scheduled) |
 | `get_scheduled_workouts(year, month)` | Training calendar for a month: self-scheduled + Garmin Coach / adaptive-plan workouts |
+| `get_upcoming_events(days_forward, limit)` | Upcoming races and plan goal events, with projected/predicted race times |
 | `get_training_readiness()` | Training readiness score |
 | `get_training_status()` | Training status |
 | `get_morning_training_readiness()` | Morning readiness |
@@ -224,8 +234,9 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | `get_power_to_weight(target_date)` | FTP / power-to-weight data |
 | `get_goals()` | User goals by status |
 | `get_earned_badges()` | Earned badges |
-| `get_gear()` | User gear items |
-| `get_gear_stats()` | Gear statistics |
+| `get_lifetime_totals()` | Lifetime distance, steps, calories and active days |
+| `get_gear_list()` | Active and retired gear with usage totals and notes (gear v2) |
+| `get_gear_details(gear_uuid)` | One piece of gear, including its default activity types (gear v2) |
 | `get_gear_defaults()` | Default gear settings |
 | `get_devices()` | Connected devices |
 | `get_sensors()` | Paired ANT+/BLE sensors and battery status |
@@ -247,6 +258,10 @@ The library automatically adds computed fields for convenience:
 - **Weight**: `weight` (grams) → `weightKg`
 - **Stress**: `stressQualifier` → `stressQualifierText` (capitalized)
 - **Nested flattening**: HRV status, training readiness, scores
+- **VO2 Max**: training status (running, else cycling), then profile settings, then recent activities
+- **Training plan goal**: the plan's goal event, else the upcoming (primary) race on your calendar
+- **Skin temperature**: `avgSkinTempDeviationC` is the nightly change from your baseline, not an absolute temperature
+- **Sanity checks**: a `metabolicAge` that can't be an age in years is returned as `None`
 
 ### Intraday timelines
 

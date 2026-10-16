@@ -7,6 +7,9 @@ GARMIN_CONNECT_API = f"{GARMIN_CONNECT}/gc-api"
 # User/Profile endpoints
 USER_PROFILE_URL = f"{GARMIN_CONNECT_API}/userprofile-service/socialProfile"
 USER_SUMMARY_URL = f"{GARMIN_CONNECT_API}/usersummary-service/usersummary/daily"
+USER_SETTINGS_URL = (
+    f"{GARMIN_CONNECT_API}/userprofile-service/userprofile/user-settings"
+)
 
 # Activity endpoints
 ACTIVITIES_URL = (
@@ -15,6 +18,8 @@ ACTIVITIES_URL = (
 ACTIVITIES_BY_DATE_URL = f"{GARMIN_CONNECT_API}/activitylist-service/activities/byDate"
 ACTIVITY_DETAILS_URL = f"{GARMIN_CONNECT_API}/activity-service/activity"
 WORKOUTS_URL = f"{GARMIN_CONNECT_API}/workout-service/workouts"
+WORKOUT_URL = f"{GARMIN_CONNECT_API}/workout-service/workout"
+WORKOUT_SCHEDULE_URL = f"{GARMIN_CONNECT_API}/workout-service/schedule"
 CALENDAR_URL = f"{GARMIN_CONNECT_API}/calendar-service/year"
 CALENDAR_EVENTS_URL = f"{GARMIN_CONNECT_API}/calendar-service/events"
 TRAINING_PLANS_URL = f"{GARMIN_CONNECT_API}/trainingplan-service/trainingplan/plans"
@@ -23,8 +28,8 @@ ADAPTIVE_TRAINING_PLAN_URL = (
 )
 # atp-api/atp/athlete/calendar (a different API gateway, not gc-api) would
 # give the weekly workout day-markers, but wants session cookies + a CSRF
-# token this client can't currently produce -- tried and reverted
-# (home-assistant-garmin_connect#521). Not defined here for that reason;
+# token this client can't currently produce -- tried and reverted. Not
+# defined here for that reason;
 # see git history on this file if picking it back up.
 
 # Wellness endpoints
@@ -41,6 +46,9 @@ DAILY_SUMMARY_CHART_URL = (
 DAILY_STRESS_URL = f"{GARMIN_CONNECT_API}/wellness-service/wellness/dailyStress"
 BODY_BATTERY_URL = (
     f"{GARMIN_CONNECT_API}/wellness-service/wellness/bodyBattery/reports/daily"
+)
+LIFETIME_TOTALS_URL = (
+    f"{GARMIN_CONNECT_API}/usersummary-service/stats/connectLifetimeTotals"
 )
 
 # Body composition endpoints
@@ -83,9 +91,7 @@ GOALS_URL = f"{GARMIN_CONNECT_API}/goal-service/goal/goals"
 BADGES_URL = f"{GARMIN_CONNECT_API}/badge-service/badge/earned"
 
 # Gear endpoints
-GEAR_URL = f"{GARMIN_CONNECT_API}/gear-service/gear/filterGear"
 GEAR_BASE_URL = f"{GARMIN_CONNECT_API}/gear-service/gear"
-GEAR_STATS_URL = f"{GARMIN_CONNECT_API}/gear-service/gear/stats"
 GEAR_DEFAULTS_URL = f"{GARMIN_CONNECT_API}/gear-service/gear/user"
 
 # Health endpoints

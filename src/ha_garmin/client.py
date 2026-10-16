@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
+import numbers
 import re
-from datetime import UTC, date, datetime, timedelta
+import ssl
+import time
+from datetime import UTC, date, datetime, timedelta, tzinfo
+from datetime import timezone as fixed_timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .const import (
     ACTIVITIES_URL,
@@ -34,16 +41,16 @@ from .const import (
     FITNESS_AGE_URL,
     GARMIN_CN_CONNECT_API,
     GARMIN_CONNECT_API,
+    GEAR_BASE_URL,
     GEAR_DEFAULTS_URL,
     GEAR_LINK_URL,
-    GEAR_STATS_URL,
-    GEAR_URL,
     GOALS_URL,
     HILL_SCORE_URL,
     HRV_URL,
     HYDRATION_LOG_URL,
     HYDRATION_URL,
     LACTATE_THRESHOLD_URL,
+    LIFETIME_TOTALS_URL,
     MENSTRUAL_CALENDAR_URL,
     MENSTRUAL_URL,
     NUTRITION_LOGS_URL,
@@ -56,11 +63,19 @@ from .const import (
     TRAINING_STATUS_URL,
     UPLOAD_URL,
     USER_PROFILE_URL,
+    USER_SETTINGS_URL,
     USER_SUMMARY_URL,
     WEIGHT_LATEST_URL,
+    WORKOUT_SCHEDULE_URL,
+    WORKOUT_URL,
     WORKOUTS_URL,
 )
-from .exceptions import GarminAPIError, GarminAuthError, GarminRateLimitError
+from .exceptions import (
+    GarminAPIError,
+    GarminAuthError,
+    GarminRateLimitError,
+    GarminTLSError,
+)
 from .models import UserProfile
 from .provenance import FetchProvenance, normalize_training_load
 
@@ -68,14 +83,177 @@ if TYPE_CHECKING:
     from .auth import GarminAuth
 
 
-def _validate_positive_int(value: Any, name: str) -> int:
-    """Validate a value is a positive integer suitable for a URL path segment."""
+def _cert_verification_failure(err: BaseException) -> str | None:
+    """Return why certificate verification failed, or None for any other error.
+
+    requests wraps the ssl error several layers deep (SSLError -> MaxRetryError
+    -> urllib3 SSLError -> ssl.SSLCertVerificationError), linked through
+    ``__cause__``, ``reason`` or ``args`` depending on the layer.
+    """
+    seen: set[int] = set()
+    pending: list[Any] = [err]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return current.verify_message or "certificate verify failed"
+        pending.extend(
+            (
+                current.__cause__,
+                current.__context__,
+                getattr(current, "reason", None),
+                *current.args,
+            )
+        )
+    if "CERTIFICATE_VERIFY_FAILED" in str(err):
+        return "certificate verify failed"
+    return None
+
+
+def _parse_connect_iq_value(raw: Any, precision: Any) -> Any:
+    """Turn a Connect IQ measurement value into a number when it is one.
+
+    Garmin sends every value as a string ("491.0", "FIT-RW-"); numbers
+    are rounded to the field's declared precision.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
     try:
+        number = float(text)
+    except ValueError:
+        return text
+    if isinstance(precision, int) and precision >= 0:
+        number = round(number, precision)
+    return int(number) if number.is_integer() else number
+
+
+def _merge_connect_iq_fields(
+    measurements: list[Any] | None, display_info: list[Any] | None
+) -> list[dict[str, Any]]:
+    """Join Connect IQ values with the field definitions of their app.
+
+    ``connectIQMeasurements`` (activity summary) carries app id, developer
+    field number and a string value. ``connectIQDisplayInfo`` carries, per
+    app, the field definitions (label/unit keys, precision, sort order)
+    and the strings those keys resolve to. A value whose definition is
+    missing is kept with a generic field name rather than dropped.
+    """
+    apps: dict[str, str] = {}
+    definitions: dict[tuple[str, int], dict[str, Any]] = {}
+    for app in display_info or []:
+        if not isinstance(app, dict):
+            continue
+        app_id = app.get("appId") or app.get("appID")
+        if not app_id:
+            continue
+        apps[app_id] = app.get("name") or app_id
+        contributions = app.get("fitContributionsJSON") or {}
+        if isinstance(contributions, str):
+            try:
+                contributions = json.loads(contributions)
+            except ValueError:
+                contributions = {}
+        strings = (contributions.get("strings") or {}).get("default") or {}
+        for datafield in contributions.get("datafields") or []:
+            if not isinstance(datafield, dict) or datafield.get("id") is None:
+                continue
+            label_key = datafield.get("label-key") or ""
+            unit_key = datafield.get("unit-label-key") or ""
+            definitions[(app_id, int(datafield["id"]))] = {
+                "field": strings.get(label_key) or label_key or None,
+                "unit": (strings.get(unit_key) or "").strip() or None,
+                "precision": datafield.get("precision"),
+                "sort": datafield.get("sort-order"),
+            }
+
+    fields: list[tuple[Any, dict[str, Any]]] = []
+    for measurement in measurements or []:
+        if not isinstance(measurement, dict):
+            continue
+        app_id = measurement.get("appID") or measurement.get("appId")
+        number = measurement.get("developerFieldNumber")
+        if not app_id or number is None:
+            continue
+        number = int(number)
+        definition = definitions.get((app_id, number), {})
+        fields.append(
+            (
+                (apps.get(app_id, app_id), definition.get("sort") or number),
+                {
+                    "app": apps.get(app_id, app_id),
+                    "field": definition.get("field") or f"field_{number}",
+                    "value": _parse_connect_iq_value(
+                        measurement.get("value"), definition.get("precision")
+                    ),
+                    "unit": definition.get("unit"),
+                    "developerFieldNumber": number,
+                },
+            )
+        )
+    return [field for _, field in sorted(fields, key=lambda item: item[0])]
+
+
+class _PerActivityCache:
+    """Cache one per-activity lookup for the current last activity.
+
+    An empty result is retried on the next ``empty_retry_limit`` polls
+    before it is cached too: Garmin's backend can take a poll or two to
+    propagate per-activity data after an upload, but an activity that
+    genuinely has none must not cost an extra API call on every poll.
+
+    Locked end-to-end so an overlapping caller (two coordinator refreshes
+    in flight) sees the finished result instead of re-fetching, where a
+    transient failure on the second call could overwrite a good result.
+    """
+
+    def __init__(self, empty_retry_limit: int) -> None:
+        self._empty_retry_limit = empty_retry_limit
+        self._lock = asyncio.Lock()
+        # (activity_id, value, consecutive_empty_polls)
+        self._entry: tuple[int, Any, int] | None = None
+
+    async def get(self, activity_id: int, fetch: Any) -> Any:
+        """Return the cached value for ``activity_id`` or fetch and cache it."""
+        async with self._lock:
+            empty_polls = 0
+            if self._entry is not None and self._entry[0] == activity_id:
+                _, value, empty_polls = self._entry
+                if value or empty_polls >= self._empty_retry_limit:
+                    return value
+            value = await fetch(activity_id)
+            self._entry = (activity_id, value, 0 if value else empty_polls + 1)
+            return value
+
+
+def _validate_positive_int(value: Any, name: str) -> int:
+    """Validate a positive integer ID and return it as an int for a URL path.
+
+    Accepts ints, whole-number floats (``123.0``) and integer strings
+    (``"123"``). Rejects bools and values such as ``1.9`` that ``int()``
+    would silently truncate. Callers must use the returned value, so the
+    URL gets the clean integer rather than the raw argument.
+    """
+    error = f"{name} must be a positive integer, got {value!r}"
+    if isinstance(value, bool):
+        raise ValueError(error)
+    if isinstance(value, numbers.Integral):
         validated = int(value)
-    except (TypeError, ValueError) as e:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}") from e
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(error)
+        validated = int(value)
+    elif isinstance(value, str):
+        try:
+            validated = int(value.strip())
+        except ValueError as e:
+            raise ValueError(error) from e
+    else:
+        raise ValueError(error)
     if validated <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        raise ValueError(error)
     return validated
 
 
@@ -91,6 +269,29 @@ def _validate_uuid(value: str, name: str) -> str:
     ):
         raise ValueError(f"{name} must be a valid UUID, got {value!r}")
     return value
+
+
+_GEAR_ACTIVITY_TYPE_NAMES = {
+    1: "running",
+    2: "cycling",
+    3: "walking",
+    4: "hiking",
+    5: "swimming",
+    6: "gym",
+    7: "yoga",
+    9: "other",
+}
+
+
+def _dashed_uuid(value: str) -> str:
+    """Return a 32-hex-digit uuid in the dashed form gear v2 expects."""
+    n = value.replace("-", "").lower()
+    return f"{n[:8]}-{n[8:12]}-{n[12:16]}-{n[16:20]}-{n[20:]}"
+
+
+def _undashed_uuid(value: str) -> str:
+    """Return the legacy undashed uuid form (stable entity identifiers)."""
+    return value.replace("-", "").lower()
 
 
 def _assert_safe_url(url: str) -> None:
@@ -109,6 +310,17 @@ def _assert_safe_url(url: str) -> None:
 def _sanitize_filename(name: str) -> str:
     """Strip characters that could break out of a multipart header value."""
     return re.sub(r'[\r\n"\\]', "_", name)
+
+
+def _upload_messages(result: dict[str, Any], *keys: str) -> list[str]:
+    """Collect the message texts from an upload's detailedImportResult lists."""
+    return [
+        content
+        for key in keys
+        for entry in result.get(key) or []
+        for msg in entry.get("messages") or []
+        if isinstance(content := msg.get("content"), str)
+    ]
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -156,6 +368,8 @@ ACTIVITY_ESSENTIAL_KEYS = {
     "activityType",
     # Polyline/GPS (for map display)
     "hasPolyline",
+    # Connect IQ data fields, merged in fetch_activity_data
+    "connectIQFields",
     "polyline",
     # VO2Max (from activity record)
     "vO2MaxValue",
@@ -198,7 +412,7 @@ ACTIVITY_ESSENTIAL_KEYS = {
 }
 
 # E-bike fields only appear in the per-activity summary endpoint response,
-# not in the activities list response (#527); merged in fetch_activity_data.
+# not in the activities list response; merged in fetch_activity_data.
 EBIKE_ACTIVITY_KEYS = (
     "eBikeBatteryRemaining",
     "eBikeBatteryUsage",
@@ -366,10 +580,12 @@ def _trim_activity(activity: dict[str, Any]) -> dict[str, Any]:
 
 # calendar-service's calendarItems mixes several unrelated event types under
 # `itemType` (observed: "weight" weigh-ins, "nap" sleep entries, "workout"
-# scheduled sessions) in one flat ~70-field-per-item shape, most of them
-# null for any given item type. Only "workout" items are Garmin Coach /
-# adaptive-plan sessions or self-scheduled workouts (#521); these are the
-# fields relevant to that one item type.
+# and "fbtAdaptiveWorkout" scheduled sessions) in one flat ~70-field-per-item
+# shape, most of them null for any given item type. Scheduled sessions come
+# in two item types: "workout" for self-scheduled workouts and Garmin Coach /
+# adaptive-plan sessions, and "fbtAdaptiveWorkout" for Daily Suggested /
+# adaptive sessions. These are the fields relevant to both.
+CALENDAR_WORKOUT_ITEM_TYPES = ("workout", "fbtAdaptiveWorkout")
 CALENDAR_WORKOUT_ESSENTIAL_KEYS = {
     "id",
     "date",
@@ -387,7 +603,7 @@ CALENDAR_WORKOUT_ESSENTIAL_KEYS = {
 
 
 def _trim_calendar_workout_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Trim a calendarItems "workout" entry to the fields that matter."""
+    """Trim a calendarItems scheduled-session entry to the fields that matter."""
     return {k: v for k, v in item.items() if k in CALENDAR_WORKOUT_ESSENTIAL_KEYS}
 
 
@@ -413,7 +629,40 @@ def _trim_goal_event(event: dict[str, Any]) -> dict[str, Any]:
             "predictedRaceTimeDurationSeconds"
         ),
         "enrollmentTime": customization.get("enrollmentTime"),
+        "primaryEvent": bool(customization.get("isPrimaryEvent")),
+        "race": bool(event.get("race")),
     }
+
+
+def _pick_goal_event(
+    events: list[dict[str, Any]], plan_id: int | None
+) -> dict[str, Any]:
+    """Pick the goal event from calendar-service/events/upcoming.
+
+    The plan's own event wins, then the primary event, then the soonest race.
+    """
+
+    def customization(event: dict[str, Any]) -> dict[str, Any]:
+        return event.get("eventCustomization") or {}
+
+    ordered = sorted(events, key=lambda e: e.get("date") or "")
+    for match in (
+        lambda e: (
+            plan_id is not None and customization(e).get("trainingPlanId") == plan_id
+        ),
+        lambda e: customization(e).get("isPrimaryEvent"),
+        lambda e: e.get("race"),
+    ):
+        event = next((e for e in ordered if match(e)), None)
+        if event:
+            return _trim_goal_event(event)
+    return {}
+
+
+_SLOW_CACHE_SECONDS = 3600
+
+# Without these the log omits dailyNutritionGoals.
+_NUTRITION_LOG_PARAMS = {"includeGoals": "true", "includeNutrition": "true"}
 
 
 def _seconds_to_minutes(seconds: int | float | None) -> int | None:
@@ -491,7 +740,7 @@ def _extract_sleep_timezone_offset_minutes(
     the exact offset for that sleep session -- no guessing, and correct
     across DST transitions. The explicit timezoneOffset keys and the
     body-battery-event fallback below aren't reliably present in every
-    account's payload (home-assistant-garmin_connect#564); when they're
+    account's payload; when they're
     absent this used to silently default to 0, storing the local wall-clock
     time mislabeled as UTC and letting Home Assistant's own UTC-to-local
     display conversion double-shift it.
@@ -537,6 +786,35 @@ _TRAINING_STATUS_MAP: dict[int, str] = {
     7: "Productive",
     8: "Strained",
 }
+
+
+def _vo2max_sport_entry(most_recent_vo2: dict[str, Any]) -> dict[str, Any]:
+    """Return the generic (running) VO2 Max entry, else the cycling one.
+
+    Garmin keeps separate estimates per sport; an account that only
+    cycles has generic set to null and only cycling filled in.
+    """
+    for sport in ("generic", "cycling"):
+        entry = most_recent_vo2.get(sport)
+        if isinstance(entry, dict) and entry.get("vo2MaxValue"):
+            return entry
+    return {}
+
+
+# Some third-party scale imports come back with a millisecond timestamp in
+# metabolicAge instead of an age in years.
+_METABOLIC_AGE_MAX_YEARS = 150
+
+
+def _sanitize_body_composition(measurement: dict[str, Any]) -> dict[str, Any]:
+    """Drop a metabolicAge that cannot be an age in years."""
+    metabolic_age = measurement.get("metabolicAge")
+    if metabolic_age is not None and not (
+        isinstance(metabolic_age, (int, float))
+        and 0 < metabolic_age <= _METABOLIC_AGE_MAX_YEARS
+    ):
+        return {**measurement, "metabolicAge": None}
+    return measurement
 
 
 def _add_computed_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -646,19 +924,32 @@ def _add_computed_fields(data: dict[str, Any]) -> dict[str, Any]:
         else:
             result["trainingStatusPhrase"] = None
         most_recent_vo2 = training_status.get("mostRecentVO2Max")
-        vo2_generic = (
-            most_recent_vo2.get("generic") or {}
+        vo2_sport = (
+            _vo2max_sport_entry(most_recent_vo2)
             if isinstance(most_recent_vo2, dict)
             else {}
         )
         result["vo2MaxValue"] = (
-            vo2_generic.get("vo2MaxValue")
+            vo2_sport.get("vo2MaxValue")
             or (most_recent_vo2 if isinstance(most_recent_vo2, (int, float)) else None)
             or training_status.get("vo2MaxValue")
         )
-        result["vo2MaxPreciseValue"] = vo2_generic.get(
+        result["vo2MaxPreciseValue"] = vo2_sport.get(
             "vo2MaxPreciseValue"
         ) or training_status.get("vo2MaxPreciseValue")
+
+        # Same block the web app reads from maxmet/latest, so no extra call.
+        vo2_block = most_recent_vo2 if isinstance(most_recent_vo2, dict) else {}
+        cycling = vo2_block.get("cycling") or {}
+        result["vo2MaxCyclingValue"] = cycling.get("vo2MaxValue")
+        acclimation = vo2_block.get("heatAltitudeAcclimation") or {}
+        result["heatAcclimationPercentage"] = acclimation.get(
+            "heatAcclimationPercentage"
+        )
+        result["heatAcclimationTrend"] = acclimation.get("heatTrend")
+        result["altitudeAcclimation"] = acclimation.get("altitudeAcclimation")
+        result["altitudeAcclimationTrend"] = acclimation.get("altitudeTrend")
+        result["currentAltitude"] = acclimation.get("currentAltitude")
 
     # === Scores: flatten nested structures ===
     endurance = result.get("enduranceScore") or {}
@@ -893,24 +1184,94 @@ class GarminClient:
         self,
         auth: GarminAuth,
         is_cn: bool = False,
+        timezone: str | None = None,
     ) -> None:
         """Initialize client.
 
         Args:
             auth: GarminAuth instance with tokens
             is_cn: Use Chinese Garmin Connect domain
+            timezone: IANA zone (e.g. "Europe/Amsterdam") used for "today" and
+                default timestamps until the Garmin account's own UTC offset
+                is learned from a daily summary. Defaults to the system zone.
         """
         self._auth = auth
+        self._fallback_tz: ZoneInfo | None = None
+        if timezone:
+            try:
+                self._fallback_tz = ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                _LOGGER.warning("Invalid timezone '%s', using system zone", timezone)
+        # UTC offset of the Garmin calendar day, learned from daily summaries.
+        self._garmin_utc_offset: timedelta | None = None
         self._is_cn = is_cn
         self._base_url = GARMIN_CN_CONNECT_API if is_cn else GARMIN_CONNECT_API
         self._profile_cache: UserProfile | None = None
-        # (activity_id, fields, consecutive_empty_polls)
-        self._ebike_fields_cache: tuple[int, dict[str, Any], int] | None = None
-        # Guards the cache above: without it, two overlapping callers (e.g. an
-        # overlapping coordinator refresh) can both race past the cache check,
-        # and a transient failure on one can overwrite the other's good result
-        # with an empty one (home-assistant-garmin_connect#527).
-        self._ebike_fields_lock = asyncio.Lock()
+        # Slow-changing data fetched at most once per _SLOW_CACHE_SECONDS:
+        # key -> (monotonic fetch time, value).
+        self._slow_cache: dict[str, tuple[float, Any]] = {}
+        # Per-activity lookups that only need one API call per new activity.
+        self._summary_fields_cache = _PerActivityCache(
+            self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
+        )
+        self._connect_iq_cache = _PerActivityCache(self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT)
+
+    def _local_tz(self) -> tzinfo:
+        """Return the zone that defines the Garmin calendar day.
+
+        Garmin keys daily data by the device's local date, which can differ
+        from the system zone (e.g. a UTC container) and from the configured
+        zone (e.g. while travelling). Preference order: the configured zone
+        when it agrees with the learned Garmin offset (keeps DST correct),
+        the learned fixed offset, the configured zone, the system zone.
+        """
+        offset = self._garmin_utc_offset
+        fallback = self._fallback_tz
+        if offset is not None:
+            if fallback is not None and datetime.now(fallback).utcoffset() == offset:
+                return fallback
+            return fixed_timezone(offset)
+        if fallback is not None:
+            return fallback
+        return datetime.now().astimezone().tzinfo or UTC
+
+    def now(self) -> datetime:
+        """Return the current time in the Garmin calendar zone (aware)."""
+        return datetime.now(self._local_tz())
+
+    def today(self) -> date:
+        """Return the current Garmin calendar date."""
+        return self.now().date()
+
+    def _parse_local_timestamp(self, timestamp: str | None) -> datetime:
+        """Parse an ISO timestamp into an aware datetime in the Garmin zone.
+
+        None means now; a naive timestamp is wall-clock time in the Garmin zone.
+        """
+        tz = self._local_tz()
+        if timestamp is None:
+            return datetime.now(tz)
+        dt = datetime.fromisoformat(timestamp)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
+    def _learn_utc_offset(self, summary: dict[str, Any]) -> None:
+        """Record the Garmin day's UTC offset from a raw daily summary."""
+        local = summary.get("wellnessStartTimeLocal")
+        gmt = summary.get("wellnessStartTimeGmt")
+        if not isinstance(local, str) or not isinstance(gmt, str):
+            return
+        try:
+            offset = datetime.fromisoformat(local) - datetime.fromisoformat(gmt)
+        except ValueError:
+            return
+        # Real offsets are whole quarter hours within +/-14h.
+        if abs(offset) > timedelta(hours=14) or offset % timedelta(minutes=15):
+            return
+        if offset != self._garmin_utc_offset:
+            _LOGGER.debug("Garmin calendar UTC offset: %s", offset)
+            self._garmin_utc_offset = offset
 
     def _get_url(self, url: str) -> str:
         """Resolve URL to correct connectapi domain."""
@@ -1057,6 +1418,14 @@ class GarminClient:
             raise
         except Exception as err:
             _LOGGER.debug("Request to %s failed: %s", url, err)
+            if (reason := _cert_verification_failure(err)) is not None:
+                host = urlsplit(url).hostname
+                raise GarminTLSError(
+                    f"TLS certificate for {host} could not be verified ({reason}). "
+                    "The connection to Garmin is being intercepted or redirected "
+                    "by a proxy, HTTPS inspection or DNS filter on this network; "
+                    f"exclude {host} from it"
+                ) from err
             raise GarminAPIError(f"Request failed: {err}") from err
 
     async def _request_bytes(self, url: str) -> bytes:
@@ -1098,6 +1467,21 @@ class GarminClient:
             )
         return bytes(response.content)
 
+    async def _cached_safe_call(self, key: str, func: Any) -> Any:
+        """_safe_call, reusing a successful result for _SLOW_CACHE_SECONDS.
+
+        For data that barely changes (lifetime totals, upcoming events), so
+        polling every few minutes doesn't cost an API call each time.
+        Failures are not cached.
+        """
+        cached = self._slow_cache.get(key)
+        if cached and time.monotonic() - cached[0] < _SLOW_CACHE_SECONDS:
+            return cached[1]
+        value = await self._safe_call(func)
+        if value is not None:
+            self._slow_cache[key] = (time.monotonic(), value)
+        return value
+
     async def _safe_call(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         """Safely call an API function, returning None on error."""
         try:
@@ -1115,20 +1499,18 @@ class GarminClient:
 
         Args:
             alarms: List of alarm dictionaries from Garmin API
-            timezone: Timezone string (e.g., "Europe/Amsterdam")
+            timezone: Timezone string (e.g., "Europe/Amsterdam"); defaults to
+                the client's Garmin-day zone
 
         Returns:
-            Sorted list of ISO format alarm datetimes, or None if no alarms/timezone
+            Sorted list of ISO format alarm datetimes, or None if no alarms
 
         Note:
             alarmTime is in minutes from midnight (e.g., 420 = 7:00 AM)
             alarmDays can be: ONCE, MONDAY, TUESDAY, etc.
         """
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
-        if not alarms or not timezone:
-            _LOGGER.debug("No alarms or timezone provided")
+        if not alarms:
+            _LOGGER.debug("No alarms provided")
             return None
 
         active_alarms: list[str] = []
@@ -1151,7 +1533,7 @@ class GarminClient:
         }
 
         try:
-            tz = ZoneInfo(timezone)
+            tz = ZoneInfo(timezone) if timezone else self._local_tz()
             now = datetime.now(tz)
         except Exception as err:
             _LOGGER.warning("Invalid timezone '%s': %s", timezone, err)
@@ -1250,6 +1632,11 @@ class GarminClient:
         self._profile_cache = UserProfile.model_validate(data)
         return self._profile_cache
 
+    async def get_user_settings(self) -> dict[str, Any]:
+        """Get the user's profile settings (userData holds the VO2 Max values)."""
+        data = await self._request("GET", USER_SETTINGS_URL)
+        return data if isinstance(data, dict) else {}
+
     async def get_daily_steps(
         self, start_date: date, end_date: date
     ) -> list[dict[str, Any]]:
@@ -1263,7 +1650,7 @@ class GarminClient:
     ) -> list[dict[str, Any]]:
         """Get intraday step-chart rows for one calendar date."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         profile = await self.get_user_profile()
         url = f"{DAILY_SUMMARY_CHART_URL}/{quote(profile.display_name, safe='')}"
@@ -1292,47 +1679,52 @@ class GarminClient:
     async def get_body_composition(
         self, target_date: date | None = None
     ) -> dict[str, Any]:
-        """Get body composition data (weight, BMI, body fat).
+        """Get the most recent weigh-in as of target_date (weight, BMI, body fat).
 
-        The API returns a 30-day range and includes both a ``totalAverage``
-        (30-day average) and a ``dateWeightList`` (individual measurements).
-        We prefer the most recent individual measurement so values match what
-        the Garmin app displays, falling back to ``totalAverage`` only when no
-        individual measurements are available.
+        Read from weight/range over the last 30 days. When that window has no
+        weigh-in, the same response's previousDateWeight is the latest one
+        before it, as a complete record (bodyWater included), so an old
+        weigh-in has the same fields as a recent one and the sensors never go
+        blank. weight/latest is only a last resort.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         start = (target_date - timedelta(days=30)).isoformat()
-        end = target_date.isoformat()
-        url = f"{BODY_COMPOSITION_URL}/{start}/{end}"
+        url = f"{BODY_COMPOSITION_URL}/{start}/{target_date.isoformat()}"
         data = await self._request("GET", url)
-        if not isinstance(data, dict):
-            return {}
-
-        summaries = data.get("dailyWeightSummaries") or []
-        if summaries:
+        if isinstance(data, dict):
             latest = max(
                 (
                     s["latestWeight"]
-                    for s in summaries
+                    for s in data.get("dailyWeightSummaries") or []
                     if (s.get("latestWeight") or {}).get("weight") is not None
                 ),
                 key=lambda m: m.get("calendarDate", ""),
                 default=None,
             )
             if latest:
-                return latest
+                return _sanitize_body_composition(latest)
+            previous = data.get("previousDateWeight") or {}
+            if previous.get("weight") is not None:
+                return _sanitize_body_composition(previous)
 
-        total_average = data.get("totalAverage") or {}
-        if total_average.get("weight") is not None:
-            return total_average
-
-        # No measurement in the 30-day window; fall back to the latest
-        # weigh-in regardless of age so sensors don't go blank.
-        params = {"date": target_date.isoformat()}
+        params = {"date": target_date.isoformat(), "ignorePriority": "true"}
         latest_data = await self._request("GET", WEIGHT_LATEST_URL, params=params)
-        return latest_data if isinstance(latest_data, dict) else {}
+        if not isinstance(latest_data, dict) or latest_data.get("weight") is None:
+            return {}
+        if "samplePk" not in latest_data and "version" in latest_data:
+            latest_data = {**latest_data, "samplePk": latest_data["version"]}
+        # "date" is the weigh-in's local wall-clock time as epoch ms.
+        local_ms = latest_data.get("date")
+        if isinstance(local_ms, (int, float)) and "calendarDate" not in latest_data:
+            latest_data = {
+                **latest_data,
+                "calendarDate": datetime.fromtimestamp(local_ms / 1000, UTC)
+                .date()
+                .isoformat(),
+            }
+        return _sanitize_body_composition(latest_data)
 
     async def get_activities(
         self, start: int = 0, limit: int = 10
@@ -1348,7 +1740,7 @@ class GarminClient:
         Unlike the activities list, this response carries the e-bike
         (ANT+ LEV) fields such as eBikeBatteryRemaining.
         """
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{ACTIVITY_DETAILS_URL}/{activity_id}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
@@ -1358,43 +1750,20 @@ class GarminClient:
     # bike, not an ANT+ LEV e-bike). Below this threshold, an empty result is
     # re-fetched on the next poll instead of being cached, since Garmin's
     # backend can take a poll or two to propagate the summary fields for a
-    # brand-new activity (#527). Once the threshold is hit, the empty result
+    # brand-new activity. Once the threshold is hit, the empty result
     # is cached like a hit would be, so a normal bike doesn't pay for an
     # extra API call on every single poll forever.
     _EBIKE_FIELDS_EMPTY_RETRY_LIMIT = 3
 
-    async def _get_ebike_fields(self, activity_id: int) -> dict[str, Any]:
-        """Fetch e-bike fields from the activity summary endpoint.
+    async def _get_summary_fields(self, activity_id: int) -> dict[str, Any]:
+        """Per-activity fields that only the summary endpoint carries.
 
-        The list endpoint never includes them (issue
-        home-assistant-garmin_connect#527). Cached per activity, so it
-        costs one extra API call per new ride, not per poll -- except a
-        handful of retries right after a new activity appears, in case
-        Garmin hasn't yet propagated the fields to the summary endpoint
-        (see _EBIKE_FIELDS_EMPTY_RETRY_LIMIT). An empty result is never
-        cached indefinitely on the first miss, so a slow backend doesn't
-        permanently poison the cache for that activity.
-
-        Locked end-to-end: an overlapping caller (e.g. two coordinator
-        refreshes in flight at once) must see this call's finished result
-        before deciding whether to fetch again, or a transient failure on
-        the second call could overwrite the first's good result with an
-        empty one (#527).
+        E-bike (ANT+ LEV) fields and Connect IQ measurements (developer
+        fields written by Connect IQ apps) never appear in the activities
+        list. One call per new activity, cached (see _PerActivityCache).
         """
-        async with self._ebike_fields_lock:
-            cached_empty_polls = 0
-            if (
-                self._ebike_fields_cache is not None
-                and self._ebike_fields_cache[0] == activity_id
-            ):
-                cached_fields = self._ebike_fields_cache[1]
-                cached_empty_polls = self._ebike_fields_cache[2]
-                if (
-                    cached_fields
-                    or cached_empty_polls >= self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
-                ):
-                    return cached_fields
 
+        async def _fetch(activity_id: int) -> dict[str, Any]:
             summary = await self._safe_call(self.get_activity, activity_id) or {}
             # Fields have been observed at the top level; check summaryDTO too
             source = {**(summary.get("summaryDTO") or {}), **summary}
@@ -1403,15 +1772,53 @@ class GarminClient:
                 for key in EBIKE_ACTIVITY_KEYS
                 if source.get(key) is not None
             }
-            empty_polls = 0 if fields else cached_empty_polls + 1
-            self._ebike_fields_cache = (activity_id, fields, empty_polls)
+            if source.get("connectIQMeasurements"):
+                fields["connectIQMeasurements"] = source["connectIQMeasurements"]
             return fields
+
+        return await self._summary_fields_cache.get(activity_id, _fetch)
+
+    async def _get_ebike_fields(self, activity_id: int) -> dict[str, Any]:
+        """E-bike fields of an activity (see _get_summary_fields)."""
+        fields = await self._get_summary_fields(activity_id)
+        return {key: fields[key] for key in EBIKE_ACTIVITY_KEYS if key in fields}
+
+    async def get_activity_connect_iq_display_info(self, activity_id: int) -> list[Any]:
+        """Get the Connect IQ field definitions used in an activity.
+
+        One entry per Connect IQ app, with its data field definitions
+        (label and unit keys, precision, sort order) and the strings those
+        keys resolve to. The values themselves are in
+        ``get_activity()["connectIQMeasurements"]``; fetch_activity_data
+        joins the two into ``lastActivity["connectIQFields"]``. Returns an
+        empty list for activities without Connect IQ fields.
+        """
+        _validate_positive_int(activity_id, "activity_id")
+        url = f"{ACTIVITY_DETAILS_URL}/{activity_id}/connectIQDisplayInfo"
+        data = await self._request("GET", url)
+        return data if isinstance(data, list) else []
+
+    async def _get_connect_iq_fields(
+        self, activity_id: int, measurements: list[Any]
+    ) -> list[dict[str, Any]]:
+        """Resolved Connect IQ fields; the definitions cost one call per activity."""
+
+        async def _fetch(activity_id: int) -> list[Any]:
+            return (
+                await self._safe_call(
+                    self.get_activity_connect_iq_display_info, activity_id
+                )
+                or []
+            )
+
+        display_info = await self._connect_iq_cache.get(activity_id, _fetch)
+        return _merge_connect_iq_fields(measurements, display_info)
 
     async def get_activity_details(
         self, activity_id: int, max_chart_size: int = 100, max_poly_size: int = 4000
     ) -> dict[str, Any]:
         """Get detailed activity information including polyline."""
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{ACTIVITY_DETAILS_URL}/{activity_id}/details"
         params = {"maxChartSize": max_chart_size, "maxPolylineSize": max_poly_size}
         data = await self._request("GET", url, params=params)
@@ -1425,7 +1832,7 @@ class GarminClient:
         Returns a list of HR zones with time spent in each zone.
         Example: [{"zoneName": "Zone 1", "secsInZone": 300}, ...]
         """
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{ACTIVITY_DETAILS_URL}/{activity_id}/hrTimeInZones"
         data = await self._request("GET", url)
         return data if isinstance(data, list) else []
@@ -1447,7 +1854,7 @@ class GarminClient:
         """Get the training calendar for a given year and month (1-12).
 
         Both self-scheduled workouts and Garmin Coach / adaptive training
-        plan sessions appear here (home-assistant-garmin_connect#521) --
+        plan sessions appear here --
         get_workouts only has the workout library, never when (or whether)
         something is scheduled.
 
@@ -1458,7 +1865,7 @@ class GarminClient:
         adaptive plan's own detail for that). See
         get_adaptive_training_plan_by_id for the fuller look-ahead.
         """
-        _validate_positive_int(year, "year")
+        year = _validate_positive_int(year, "year")
         if not 1 <= month <= 12:
             raise ValueError(f"month must be between 1 and 12, got: {month}")
         # Garmin's API is 0-indexed for month on this endpoint specifically.
@@ -1470,7 +1877,7 @@ class GarminClient:
         """Get the user's training plans (e.g. an active Garmin Coach plan).
 
         Response shape is not verified against a real account yet --
-        exploratory, for home-assistant-garmin_connect#521.
+        exploratory.
         """
         return await self._request("GET", TRAINING_PLANS_URL)
 
@@ -1478,36 +1885,28 @@ class GarminClient:
         """Get an adaptive (Garmin Coach) training plan's own detail.
 
         Ported from python-garminconnect; response shape not verified
-        against a real account. Superseded in priority by
-        get_adaptive_plan_calendar and get_calendar_events_for_plan below,
-        both confirmed directly from the Garmin Connect web app's own
-        network calls -- kept in case it turns out to carry something
-        those don't (home-assistant-garmin_connect#521).
+        against a real account. The plan's goal event comes from
+        get_upcoming_events.
         """
-        _validate_positive_int(plan_id, "plan_id")
+        plan_id = _validate_positive_int(plan_id, "plan_id")
         url = f"{ADAPTIVE_TRAINING_PLAN_URL}/{plan_id}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
 
-    async def get_calendar_events_for_plan(
-        self, training_plan_id: int
+    async def get_upcoming_events(
+        self, days_forward: int = 365, limit: int = 10
     ) -> list[dict[str, Any]]:
-        """Get a training plan's goal event (target race, projected time).
+        """Get upcoming calendar events: races, plan goal events, the primary event.
 
-        Confirmed via the Garmin Connect web app's own network calls
-        (home-assistant-garmin_connect#521): returns the plan's own goal
-        event -- event name, target distance, target date,
-        projected/predicted race time. Not the weekly workout schedule --
-        that lives behind atp-api/atp/athlete/calendar, a different API
-        gateway this client can't currently authenticate against (it
-        wants session cookies + a CSRF token, not the DI Bearer token
-        this client uses everywhere else). Tried and reverted; revisit if
-        a reason to support cookie-based auth turns up for something
-        else too.
+        Each event carries eventCustomization (isPrimaryEvent, trainingPlanId,
+        trainingPlanType, projected/predicted race time).
         """
-        _validate_positive_int(training_plan_id, "training_plan_id")
-        params = {"trainingPlanId": training_plan_id}
-        data = await self._request("GET", CALENDAR_EVENTS_URL, params=params)
+        days_forward = _validate_positive_int(days_forward, "days_forward")
+        limit = _validate_positive_int(limit, "limit")
+        params = {"numDaysForward": days_forward, "limit": limit}
+        data = await self._request(
+            "GET", f"{CALENDAR_EVENTS_URL}/upcoming", params=params
+        )
         return data if isinstance(data, list) else []
 
     async def get_hydration_data(
@@ -1515,7 +1914,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get hydration data for a date."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{HYDRATION_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1529,7 +1928,7 @@ class GarminClient:
         the normalized [[epoch_ms, value], ...] timelines.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{DAILY_STRESS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1540,7 +1939,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get training readiness data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{TRAINING_READINESS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1558,7 +1957,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get training status data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{TRAINING_STATUS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1569,7 +1968,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get endurance score."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         params = {"calendarDate": target_date.isoformat()}
         data = await self._request("GET", ENDURANCE_SCORE_URL, params=params)
@@ -1578,7 +1977,7 @@ class GarminClient:
     async def get_hill_score(self, target_date: date | None = None) -> dict[str, Any]:
         """Get hill score."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         params = {"calendarDate": target_date.isoformat()}
         data = await self._request("GET", HILL_SCORE_URL, params=params)
@@ -1587,7 +1986,7 @@ class GarminClient:
     async def get_fitness_age(self, target_date: date | None = None) -> dict[str, Any]:
         """Get fitness age data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{FITNESS_AGE_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1614,7 +2013,7 @@ class GarminClient:
     ) -> list[dict[str, Any]]:
         """Get power-to-weight (FTP) data for a date."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{POWER_TO_WEIGHT_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1634,9 +2033,9 @@ class GarminClient:
         solarInputReadings (solarUtilization %, activityTimeGainMs) per reading.
         Empty dict for devices without solar charging.
         """
-        _validate_positive_int(device_id, "device_id")
+        device_id = _validate_positive_int(device_id, "device_id")
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         day = target_date.isoformat()
         url = f"{DEVICE_SOLAR_URL}/{device_id}/{day}/{day}"
@@ -1669,27 +2068,38 @@ class GarminClient:
         data = await self._request("GET", GOALS_URL, params=params)
         return data if isinstance(data, list) else []
 
+    async def get_lifetime_totals(self) -> dict[str, Any]:
+        """Get lifetime totals: distance (m), steps, calories, active days."""
+        profile = await self.get_user_profile()
+        url = f"{LIFETIME_TOTALS_URL}/{quote(profile.display_name, safe='')}"
+        data = await self._request("GET", url)
+        return data if isinstance(data, dict) else {}
+
     async def get_earned_badges(self) -> list[dict[str, Any]]:
         """Get earned badges."""
         data = await self._request("GET", BADGES_URL)
         return data if isinstance(data, list) else []
 
-    async def get_gear(self, user_profile_id: int) -> list[dict[str, Any]]:
-        """Get user gear."""
-        params = {"userProfilePk": str(user_profile_id)}
-        data = await self._request("GET", GEAR_URL, params=params)
+    async def get_gear_list(self) -> list[dict[str, Any]]:
+        """Get all active and retired gear, with usage totals (gear v2).
+
+        Each entry carries distanceUsedMeters, durationUsedSeconds,
+        numActivitiesLinked, daysUsed and notes, so no per-gear stats call
+        is needed. uuids are dashed.
+        """
+        params = {"start": 0, "limit": 100, "gearStatuses": ["ACTIVE", "RETIRED"]}
+        data = await self._request("GET", f"{GEAR_BASE_URL}/v2/list", params=params)
         return data if isinstance(data, list) else []
 
-    async def get_gear_stats(self, gear_uuid: str) -> dict[str, Any]:
-        """Get gear statistics."""
-        _validate_uuid(gear_uuid, "gear_uuid")
-        url = f"{GEAR_STATS_URL}/{gear_uuid}"
-        data = await self._request("GET", url)
+    async def get_gear_details(self, gear_uuid: str) -> dict[str, Any]:
+        """Get one piece of gear (gear v2), including associatedActivityTypes."""
+        gear_uuid = _dashed_uuid(_validate_uuid(gear_uuid, "gear_uuid"))
+        data = await self._request("GET", f"{GEAR_BASE_URL}/v2/{gear_uuid}")
         return data if isinstance(data, dict) else {}
 
     async def get_gear_defaults(self, user_profile_id: int) -> list[dict[str, Any]]:
         """Get default gear settings."""
-        _validate_positive_int(user_profile_id, "user_profile_id")
+        user_profile_id = _validate_positive_int(user_profile_id, "user_profile_id")
         url = f"{GEAR_DEFAULTS_URL}/{user_profile_id}/activityTypes"
         data = await self._request("GET", url)
         return data if isinstance(data, list) else []
@@ -1709,10 +2119,12 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get menstrual cycle data."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{MENSTRUAL_URL}/{target_date.isoformat()}"
-        data = await self._request("GET", url)
+        # Garmin uses todayDate to tell recorded days from predicted ones.
+        params = {"todayDate": self.today().isoformat()}
+        data = await self._request("GET", url, params=params)
         return data if isinstance(data, dict) else {}
 
     async def get_menstrual_calendar(
@@ -1723,15 +2135,16 @@ class GarminClient:
         Returns cycle summaries including predicted cycles.
         """
         if start_date is None:
-            start_date = date.today() - timedelta(days=30)
+            start_date = self.today() - timedelta(days=30)
         if end_date is None:
-            end_date = date.today() + timedelta(days=60)
+            end_date = self.today() + timedelta(days=59)
 
         if start_date > end_date:
             raise ValueError("start_date cannot be after end_date")
 
-        if (end_date - start_date).days > 92:
-            end_date = start_date + timedelta(days=92)
+        # Garmin rejects windows of 92+ days (counted inclusively).
+        if (end_date - start_date).days > 89:
+            end_date = start_date + timedelta(days=89)
 
         url = MENSTRUAL_CALENDAR_URL.format(
             start_date=start_date.isoformat(), end_date=end_date.isoformat()
@@ -1748,9 +2161,11 @@ class GarminClient:
         Returns {} when the account has no nutrition setup (endpoint 404s).
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
         data = await self._request(
-            "GET", f"{NUTRITION_LOGS_URL}/{target_date.isoformat()}"
+            "GET",
+            f"{NUTRITION_LOGS_URL}/{target_date.isoformat()}",
+            params=_NUTRITION_LOG_PARAMS,
         )
         return data if isinstance(data, dict) else {}
 
@@ -1759,7 +2174,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get daily summary as raw dict for flat data output."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         profile = await self.get_user_profile()
         # display_name comes from the server; quote it so a hostile response
@@ -1767,14 +2182,17 @@ class GarminClient:
         url = f"{USER_SUMMARY_URL}/{quote(profile.display_name, safe='')}"
         params = {"calendarDate": target_date.isoformat()}
         data = await self._request("GET", url, params=params)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        self._learn_utc_offset(data)
+        return data
 
     async def _get_sleep_data_raw(
         self, target_date: date | None = None
     ) -> dict[str, Any]:
         """Get sleep data as raw dict for flat data output."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = SLEEP_URL
         params = {"date": target_date.isoformat(), "nonSleepBufferMinutes": 60}
@@ -1786,7 +2204,7 @@ class GarminClient:
     ) -> dict[str, Any]:
         """Get HRV data as raw dict for flat data output."""
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{HRV_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1822,7 +2240,7 @@ class GarminClient:
 
     async def get_device_settings(self, device_id: int) -> dict[str, Any]:
         """Get device settings for a specific device."""
-        _validate_positive_int(device_id, "device_id")
+        device_id = _validate_positive_int(device_id, "device_id")
         url = f"{GARMIN_CONNECT_API}/device-service/deviceservice/device-info/settings/{device_id}"
         data = await self._request("GET", url)
         return data if isinstance(data, dict) else {}
@@ -1836,7 +2254,7 @@ class GarminClient:
         with inputContext == 'AFTER_WAKEUP_RESET'.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         url = f"{TRAINING_READINESS_URL}/{target_date.isoformat()}"
         data = await self._request("GET", url)
@@ -1896,7 +2314,9 @@ class GarminClient:
 
         if response.status_code not in (200, 201, 204):
             _LOGGER.error("POST failed %s", response.status_code)
-            raise GarminAPIError(f"POST failed: {response.status_code}")
+            raise GarminAPIError(
+                f"POST failed: {response.status_code}", response.status_code
+            )
 
         if response.status_code == 204:
             return {}
@@ -1944,7 +2364,9 @@ class GarminClient:
             response = await asyncio.to_thread(_do_put, headers)
 
         if response.status_code not in (200, 201, 204):
-            raise GarminAPIError(f"PUT failed: {response.status_code}")
+            raise GarminAPIError(
+                f"PUT failed: {response.status_code}", response.status_code
+            )
 
         if response.status_code == 204:
             return {}
@@ -1973,13 +2395,17 @@ class GarminClient:
             headers.update(DEFAULT_HEADERS)
             response = await asyncio.to_thread(_do_delete, headers)
             if response.status_code not in (200, 204):
-                raise GarminAPIError(f"DELETE failed: {response.status_code}")
+                raise GarminAPIError(
+                    f"DELETE failed: {response.status_code}", response.status_code
+                )
             if response.status_code == 204:
                 return {}
             return response.json()
 
         if response.status_code not in (200, 204):
-            raise GarminAPIError(f"DELETE failed: {response.status_code}")
+            raise GarminAPIError(
+                f"DELETE failed: {response.status_code}", response.status_code
+            )
 
         if response.status_code == 204:
             return {}
@@ -2021,10 +2447,14 @@ class GarminClient:
             headers.update(DEFAULT_HEADERS)
             response = await asyncio.to_thread(_do_upload, headers)
             if response.status_code not in (200, 201):
-                raise GarminAPIError(f"FIT upload failed: {response.status_code}")
+                raise GarminAPIError(
+                    f"FIT upload failed: {response.status_code}", response.status_code
+                )
 
         if response.status_code not in (200, 201):
-            raise GarminAPIError(f"FIT upload failed: {response.status_code}")
+            raise GarminAPIError(
+                f"FIT upload failed: {response.status_code}", response.status_code
+            )
 
         return response.json()
 
@@ -2043,10 +2473,15 @@ class GarminClient:
             diastolic: Diastolic blood pressure (40-150)
             pulse: Pulse rate (20-250). Optional - Garmin Connect's own UI
                 accepts a blood pressure entry without a heart rate.
-            timestamp: ISO timestamp (defaults to now)
+            timestamp: ISO timestamp (defaults to now; naive means Garmin local time)
             notes: Optional notes
         """
-        from datetime import datetime
+        checks = [("systolic", systolic, 70, 260), ("diastolic", diastolic, 40, 150)]
+        if pulse is not None:
+            checks.append(("pulse", pulse, 20, 250))
+        for name, val, lo, hi in checks:
+            if isinstance(val, bool) or not isinstance(val, int) or not lo <= val <= hi:
+                raise ValueError(f"{name} must be an int in [{lo}, {hi}]")
 
         _LOGGER.debug(
             "set_blood_pressure called with systolic=%s, diastolic=%s, pulse=%s, timestamp=%s",
@@ -2056,7 +2491,7 @@ class GarminClient:
             timestamp,
         )
 
-        dt = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        dt = self._parse_local_timestamp(timestamp)
         dt_gmt = dt.astimezone(UTC)
 
         def fmt_ts(d: datetime) -> str:
@@ -2087,24 +2522,40 @@ class GarminClient:
 
         Args:
             value_in_ml: Amount in millilitres (positive to add, negative to subtract, max 10000)
-            cdate: Calendar date YYYY-MM-DD (defaults to today)
-            timestamp: ISO timestamp, with or without milliseconds (defaults to now)
+            cdate: Calendar date YYYY-MM-DD (defaults to the timestamp's date;
+                on its own, logs at midnight of that date)
+            timestamp: ISO timestamp, with or without milliseconds (defaults to
+                now; naive means Garmin local time)
         """
-        from datetime import datetime
-
+        if isinstance(value_in_ml, bool) or not isinstance(value_in_ml, numbers.Real):
+            raise ValueError("value_in_ml must be a number")
+        value_in_ml = float(value_in_ml)
+        if not math.isfinite(value_in_ml):
+            raise ValueError("value_in_ml must be a finite number")
         if abs(value_in_ml) > 10000:
             raise ValueError("Hydration value cannot exceed 10000 mL")
 
-        dt = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        if cdate is not None:
+            cdate = date.fromisoformat(cdate).isoformat()
+        if timestamp is None and cdate is not None:
+            dt = datetime.fromisoformat(cdate).replace(tzinfo=self._local_tz())
+        else:
+            dt = self._parse_local_timestamp(timestamp)
+        if cdate is not None and dt.date().isoformat() != cdate:
+            raise ValueError(
+                f"timestamp date ({dt.date().isoformat()}) doesn't match cdate ({cdate})"
+            )
+        cdate = dt.date().isoformat()
         timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
-        if cdate is None:
-            cdate = date.today().isoformat()
 
-        payload = {
+        payload: dict[str, Any] = {
             "calendarDate": cdate,
             "timestampLocal": timestamp,
             "valueInML": value_in_ml,
         }
+        profile = await self._safe_call(self.get_user_profile)
+        if profile and profile.profile_id:
+            payload["userProfileId"] = profile.profile_id
 
         _LOGGER.debug("Hydration payload: %s", payload)
         return await self._put_request(HYDRATION_LOG_URL, payload)
@@ -2120,7 +2571,9 @@ class GarminClient:
         then to meals[0].
         """
         try:
-            data = await self._request("GET", f"{NUTRITION_LOGS_URL}/{log_date}")
+            data = await self._request(
+                "GET", f"{NUTRITION_LOGS_URL}/{log_date}", params=_NUTRITION_LOG_PARAMS
+            )
             if isinstance(data, dict):
                 meals: list[tuple[int, str | None, str | None]] = []
                 for detail in data.get("mealDetails") or []:
@@ -2171,31 +2624,17 @@ class GarminClient:
             fat: Fat in grams
             name: Label for the log entry
             meal_time: Meal time as HH:MM:SS (defaults to current time)
-            timestamp: ISO 8601 timestamp (defaults to now)
+            timestamp: ISO 8601 timestamp (defaults to now; naive means
+                Garmin local time)
             meal_id: Garmin meal slot ID. If not provided, fetched from today's
                      log; falls back to null which lets Garmin assign it.
         """
-        now_utc = datetime.now(UTC)
-        now_local = now_utc.astimezone()
-        log_date = now_local.strftime("%Y-%m-%d")
-
-        if timestamp is None:
-            log_timestamp = (
-                now_utc.strftime("%Y-%m-%dT%H:%M:%S.")
-                + f"{now_utc.microsecond // 1000:03d}Z"
-            )
-            local_time = now_local
-        else:
-            dt = datetime.fromisoformat(timestamp)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-            dt_utc = dt.astimezone(UTC)
-            local_time = dt.astimezone()
-            log_date = local_time.strftime("%Y-%m-%d")
-            log_timestamp = (
-                dt_utc.strftime("%Y-%m-%dT%H:%M:%S.")
-                + f"{dt_utc.microsecond // 1000:03d}Z"
-            )
+        local_time = self._parse_local_timestamp(timestamp)
+        dt_utc = local_time.astimezone(UTC)
+        log_date = local_time.strftime("%Y-%m-%d")
+        log_timestamp = (
+            dt_utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt_utc.microsecond // 1000:03d}Z"
+        )
 
         if meal_time is None:
             meal_time = local_time.strftime("%H:%M:%S")
@@ -2252,7 +2691,7 @@ class GarminClient:
 
         Args:
             weight: Weight in kg (required)
-            timestamp: ISO timestamp (defaults to now)
+            timestamp: ISO timestamp (defaults to now; naive means Garmin local time)
             percent_fat: Body fat percentage
             percent_hydration: Hydration percentage
             visceral_fat_mass: Visceral fat mass in kg
@@ -2265,7 +2704,6 @@ class GarminClient:
             visceral_fat_rating: Visceral fat rating (1-59)
             bmi: Body mass index
         """
-        from datetime import datetime
 
         from .fit import FitEncoderWeight  # type: ignore[attr-defined]
 
@@ -2275,7 +2713,7 @@ class GarminClient:
             timestamp,
         )
 
-        dt = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        dt = self._parse_local_timestamp(timestamp)
 
         # Build FIT file
         fit_encoder = FitEncoderWeight()
@@ -2342,36 +2780,60 @@ class GarminClient:
         else:
             raise ValueError(f"Unknown setting: {setting}")
 
-        # Use consistent URL format with python-garminconnect:
-        # PUT gear-service/gear/{gearUUID}/activityType/{activityTypeId}/default/true
-        # DELETE gear-service/gear/{gearUUID}/activityType/{activityTypeId}
-        # Note: activityType must be numeric (1=running, 2=cycling, etc.)
-
-        activity_type_map = {
-            "running": 1,
-            "cycling": 2,
-            "walking": 3,
-            "hiking": 4,
-            "swimming": 5,
-            "other": 9,
-        }
-        activity_type_id = activity_type_map.get(activity_type.lower())
-        if activity_type_id is None:
-            # Never fall through with the raw string: it would be spliced
-            # unvalidated into a state-changing PUT/DELETE URL.
+        # The legacy activityType/{id}/default endpoint 404s for gear created
+        # through gear v2, so edit the gear's associatedActivityTypes and PUT
+        # the complete object back (Garmin rejects partial bodies).
+        activity_type_ids = {name: pk for pk, name in _GEAR_ACTIVITY_TYPE_NAMES.items()}
+        activity_key = activity_type.lower()
+        activity_type_id = activity_type_ids.get(activity_key)
+        if activity_type_id is None or activity_key in ("gym", "yoga"):
             raise ValueError(
-                f"Unknown activity_type: {activity_type!r} "
-                f"(expected one of {sorted(activity_type_map)})"
+                f"Unknown activity_type: {activity_type!r} (expected one of "
+                f"{sorted(k for k in activity_type_ids if k not in ('gym', 'yoga'))})"
             )
 
-        url_path = f"/gear-service/gear/{gear_uuid}/activityType/{activity_type_id}"
+        result = await self._set_gear_activity_default(
+            gear_uuid, activity_key, default_gear
+        )
+        if setting == "set this as default, unset others":
+            profile = await self.get_user_profile()
+            defaults = await self.get_gear_defaults(profile.profile_id)
+            target = _undashed_uuid(gear_uuid)
+            others = {
+                _undashed_uuid(d["uuid"])
+                for d in defaults
+                if d.get("uuid")
+                and d.get("activityTypePk") == activity_type_id
+                and d.get("defaultGear")
+                and _undashed_uuid(d["uuid"]) != target
+            }
+            for other in sorted(others):
+                await self._set_gear_activity_default(other, activity_key, False)
+        return result
 
+    async def _set_gear_activity_default(
+        self, gear_uuid: str, activity_key: str, default_gear: bool
+    ) -> dict[str, Any]:
+        """Add or remove one activity type from a gear's defaults (gear v2)."""
+        details = await self.get_gear_details(gear_uuid)
+        if not details:
+            raise GarminAPIError(f"Gear {gear_uuid} not found", 404)
+        associations = [
+            a
+            for a in details.get("associatedActivityTypes") or []
+            if a.get("activityTypeKey") != activity_key
+        ]
         if default_gear:
-            url = f"{GARMIN_CONNECT_API}{url_path}/default/true"
-            return await self._put_request(url)
-        else:
-            url = f"{GARMIN_CONNECT_API}{url_path}"
-            return await self._delete_request(url=url)
+            associations.append(
+                {
+                    "activityTypeKey": activity_key,
+                    "defaultGear": True,
+                    "preferredGear": False,
+                }
+            )
+        payload = {**details, "associatedActivityTypes": associations}
+        url = f"{GEAR_BASE_URL}/v2/{_dashed_uuid(gear_uuid)}"
+        return await self._put_request(url, payload)
 
     async def create_activity(
         self,
@@ -2424,7 +2886,7 @@ class GarminClient:
         Returns:
             Raw file bytes.
         """
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         fmt = file_format.lower()
         allowed_formats = {"fit", "original", "tcx", "gpx", "kml", "csv"}
         if fmt not in allowed_formats:
@@ -2508,38 +2970,38 @@ class GarminClient:
             headers = self._auth.get_api_headers()
             headers["User-Agent"] = "GCM-iOS-5.7.2.1"
             response = await asyncio.to_thread(_do_upload, headers)
-            if response.status_code not in (200, 201, 400):
-                raise GarminAPIError(f"Upload failed: {response.status_code}")
-            try:
-                return response.json()
-            except Exception:
-                return {"raw": response.text}
 
         try:
             body = response.json()
         except Exception:
             raise GarminAPIError(
-                f"Upload failed: {response.status_code} (non-JSON response)"
+                f"Upload failed: {response.status_code} (non-JSON response)",
+                response.status_code,
             ) from None
 
         # 400 with uploadId means file was accepted but has validation issues
-        if response.status_code == 400 and (body.get("detailedImportResult") or {}).get(
-            "uploadId"
-        ):
-            _LOGGER.warning("Upload accepted with warnings: %s", body)
+        result = body.get("detailedImportResult") or {}
+        if response.status_code == 400 and result.get("uploadId"):
+            # Log only Garmin's messages: the full response also carries the
+            # account's user ID and upload IDs, and warnings land in HA logs.
+            _LOGGER.warning(
+                "Upload accepted with warnings: %s",
+                "; ".join(_upload_messages(result, "failures", "successes"))
+                or "no details",
+            )
             return body
 
         if response.status_code not in (200, 201, 202):
-            result = body.get("detailedImportResult") or {}
-            failures = result.get("failures") or []
-            if failures:
-                messages = []
-                for failure in failures:
-                    for msg in failure.get("messages", []):
-                        messages.append(msg.get("content", "Unknown error"))
-                error_msg = "; ".join(messages) if messages else "Unknown error"
-                raise GarminAPIError(f"Upload failed: {error_msg}")
-            raise GarminAPIError(f"Upload failed: {response.status_code}")
+            if result.get("failures"):
+                error_msg = (
+                    "; ".join(_upload_messages(result, "failures")) or "Unknown error"
+                )
+                raise GarminAPIError(
+                    f"Upload failed: {error_msg}", response.status_code
+                )
+            raise GarminAPIError(
+                f"Upload failed: {response.status_code}", response.status_code
+            )
         return body
 
     async def add_gear_to_activity(
@@ -2552,9 +3014,69 @@ class GarminClient:
             activity_id: ID of the activity
         """
         _validate_uuid(gear_uuid, "gear_uuid")
-        _validate_positive_int(activity_id, "activity_id")
+        activity_id = _validate_positive_int(activity_id, "activity_id")
         url = f"{GEAR_LINK_URL}/{gear_uuid}/activity/{activity_id}"
         return await self._put_request(url)
+
+    async def create_workout(self, workout: dict[str, Any]) -> dict[str, Any]:
+        """Create a workout in the workout library.
+
+        Args:
+            workout: Garmin workout JSON (workoutName, sportType, workoutSegments)
+
+        Returns:
+            The created workout, including its new workoutId
+        """
+        if not isinstance(workout, dict):
+            raise ValueError("workout must be a JSON object")
+        return await self._post_request(WORKOUT_URL, workout)
+
+    async def update_workout(
+        self, workout_id: int, workout: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Replace a workout in place; its id and calendar schedules are kept.
+
+        Args:
+            workout_id: ID of the workout to replace
+            workout: Complete Garmin workout JSON (workoutId is forced to match)
+        """
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        if not isinstance(workout, dict):
+            raise ValueError("workout must be a JSON object")
+        url = f"{WORKOUT_URL}/{workout_id}"
+        return await self._put_request(url, workout | {"workoutId": workout_id})
+
+    async def delete_workout(self, workout_id: int) -> dict[str, Any]:
+        """Delete a workout from the library (also drops its schedules)."""
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        return await self._delete_request(f"{WORKOUT_URL}/{workout_id}")
+
+    async def schedule_workout(
+        self, workout_id: int, schedule_date: date | str
+    ) -> dict[str, Any]:
+        """Put a library workout on the training calendar.
+
+        Args:
+            workout_id: ID of the workout to schedule
+            schedule_date: Calendar date (date or YYYY-MM-DD)
+
+        Returns:
+            The schedule entry; its id is what unschedule_workout takes
+        """
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        if isinstance(schedule_date, str):
+            schedule_date = date.fromisoformat(schedule_date)
+        url = f"{WORKOUT_SCHEDULE_URL}/{workout_id}"
+        return await self._post_request(url, {"date": schedule_date.isoformat()})
+
+    async def unschedule_workout(self, scheduled_workout_id: int) -> dict[str, Any]:
+        """Remove a workout from the calendar without deleting it."""
+        scheduled_workout_id = _validate_positive_int(
+            scheduled_workout_id, "scheduled_workout_id"
+        )
+        return await self._delete_request(
+            f"{WORKOUT_SCHEDULE_URL}/{scheduled_workout_id}"
+        )
 
     # ========== Multi-Coordinator Fetch Methods ==========
 
@@ -2565,7 +3087,7 @@ class GarminClient:
         get_daily_stress (4 calls)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         yesterday_date = target_date - timedelta(days=1)
         week_ago = target_date - timedelta(days=7)
@@ -2580,7 +3102,7 @@ class GarminClient:
         # not be treated as "not ready" - otherwise a temporary Garmin
         # outage would silently overwrite all of today's data, including
         # fast-changing fields like body battery, with a full day-old
-        # snapshot (cyberjunky/home-assistant-garmin_connect#536).
+        # snapshot.
         provenance = FetchProvenance(target_date)
         summary_raw = await provenance.read(
             "summary", self._get_user_summary_raw, target_date
@@ -2640,8 +3162,17 @@ class GarminClient:
         wake_time = None
         optimal_wake_time = None
         avg_sleep_respiration_value = None
+        skin_temp_deviation = None
+        skin_temp_calibration_days = None
 
         if sleep_data:
+            # Skin temperature sits at the root of the sleep response, not in
+            # dailySleepDTO, and is a change from the wearer's own baseline,
+            # not an absolute temperature. Only devices with a skin
+            # temperature sensor report it.
+            if sleep_data.get("skinTempDataExists"):
+                skin_temp_deviation = sleep_data.get("avgSkinTempDeviationC")
+                skin_temp_calibration_days = sleep_data.get("skinTempCalibrationDays")
             try:
                 daily_sleep = sleep_data.get("dailySleepDTO") or {}
                 sleep_alignment = daily_sleep.get("sleepAlignment") or {}
@@ -2654,8 +3185,8 @@ class GarminClient:
                 rem_sleep_seconds = daily_sleep.get("remSleepSeconds")
                 awake_sleep_seconds = daily_sleep.get("awakeSleepSeconds")
                 nap_time_seconds = daily_sleep.get("napTimeSeconds")
-                # Only meaningful average Garmin's API exposes for respiration
-                # (home-assistant-garmin_connect#568); the summary endpoint
+                # Only meaningful average Garmin's API exposes for respiration;
+                # the summary endpoint
                 # only has day-wide latest/lowest/highest, and a client-side
                 # average from those is unreliable since the read frequency
                 # backing them varies.
@@ -2747,6 +3278,8 @@ class GarminClient:
             "wakeTime": wake_time,
             "optimalWakeTime": optimal_wake_time,
             "avgSleepRespirationValue": avg_sleep_respiration_value,
+            "avgSkinTempDeviationC": skin_temp_deviation,
+            "skinTempCalibrationDays": skin_temp_calibration_days,
         }
         data["_sources"] = {
             k: v for k, v in provenance.sources.items() if not k.endswith("Fallback")
@@ -2759,10 +3292,10 @@ class GarminClient:
         return result
 
     # How many recent activities to pull for `lastActivities`. Consumers (e.g.
-    # home-assistant-garmin_connect#567) derive a rolling-week count from this
+    # the Home Assistant integration) derive a rolling-week count from this
     # list; fetching only 10 meant that count silently pinned at 10 forever
     # for anyone averaging 10+ activities a week, since the fetch itself, not
-    # the 7-day filter, was the actual ceiling. Bumped 25 -> 50 (ha-garmin#30)
+    # the 7-day filter, was the actual ceiling. Bumped 25 -> 50
     # for the same reason at the next tier up, while staying a single bounded
     # list call.
     _RECENT_ACTIVITIES_LIMIT = 50
@@ -2775,16 +3308,16 @@ class GarminClient:
         API calls: get_activities, get_activity_details,
                    get_activity_hr_in_timezones, get_workouts,
                    get_scheduled_workouts x2 (this + next month) (6 calls),
-                   plus get_activity for rides (e-bike fields, #527), plus
-                   get_calendar_events_for_plan when a scheduled workout
-                   carries an atpPlanId
+                   get_upcoming_events at most once an hour, get_activity once per
+                   new activity (e-bike fields, Connect IQ measurements) and
+                   get_activity_connect_iq_display_info when it has any
 
         target_date is kept for signature compatibility; activities are
         fetched by recency (newest _RECENT_ACTIVITIES_LIMIT), not by date.
         """
 
         # The most recent activities regardless of age (newest first), so
-        # lastActivity never goes blank after an inactive week (issue #519).
+        # lastActivity never goes blank after an inactive week.
         recent_activities = await self._safe_call(
             self.get_activities, 0, self._RECENT_ACTIVITIES_LIMIT
         )
@@ -2793,9 +3326,26 @@ class GarminClient:
             last_activity = dict(recent_activities[0])
             activity_id = last_activity.get("activityId")
 
-            # E-bike battery fields live only on the summary endpoint (#527)
-            if activity_id is not None and _is_cycling_activity(last_activity):
-                last_activity.update(await self._get_ebike_fields(int(activity_id)))
+            # E-bike fields and Connect IQ measurements live only on the
+            # summary endpoint, one call per new activity. The list carries
+            # no hint of either, so every new activity is checked once.
+            if activity_id is not None:
+                summary_fields = await self._get_summary_fields(int(activity_id))
+                if _is_cycling_activity(last_activity):
+                    last_activity.update(
+                        {
+                            k: v
+                            for k, v in summary_fields.items()
+                            if k in EBIKE_ACTIVITY_KEYS
+                        }
+                    )
+                measurements = summary_fields.get("connectIQMeasurements")
+                if measurements:
+                    last_activity[
+                        "connectIQFields"
+                    ] = await self._get_connect_iq_fields(
+                        int(activity_id), measurements
+                    )
 
             # Fetch polyline
             if last_activity.get("hasPolyline") and activity_id is not None:
@@ -2833,9 +3383,9 @@ class GarminClient:
         trimmed_last_activity = _trim_activity(last_activity) if last_activity else {}
 
         # Training calendar: Garmin Coach / adaptive-plan sessions and
-        # self-scheduled workouts (#521). Fetches this month and next so a
+        # self-scheduled workouts. Fetches this month and next so a
         # session right after a month boundary isn't missed.
-        today = date.today()
+        today = target_date or self.today()
         next_month = today.month + 1 if today.month < 12 else 1
         next_month_year = today.year if today.month < 12 else today.year + 1
         calendar_this_month = (
@@ -2848,8 +3398,14 @@ class GarminClient:
             )
             or {}
         )
-        calendar_items = (calendar_this_month.get("calendarItems") or []) + (
-            calendar_next_month.get("calendarItems") or []
+        # Each month view also covers the adjacent months' days shown in its
+        # grid, so an item near a month boundary comes back from both calls.
+        calendar_items = list(
+            {
+                (item.get("id"), item.get("itemType"), item.get("date")): item
+                for item in (calendar_this_month.get("calendarItems") or [])
+                + (calendar_next_month.get("calendarItems") or [])
+            }.values()
         )
 
         today_str = today.isoformat()
@@ -2857,7 +3413,7 @@ class GarminClient:
             (
                 _trim_calendar_workout_item(item)
                 for item in calendar_items
-                if item.get("itemType") == "workout"
+                if item.get("itemType") in CALENDAR_WORKOUT_ITEM_TYPES
                 and (item.get("date") or "") >= today_str
             ),
             key=lambda w: w.get("date") or "",
@@ -2867,17 +3423,18 @@ class GarminClient:
         )
         next_workout = scheduled_workouts[0] if scheduled_workouts else {}
 
-        # The plan's own goal event (target race, distance, projected time).
-        # atpPlanId (not the workout item's own trainingPlanId field, which
-        # has been observed as a stale 0) is the id calendar-service/events
-        # actually wants.
-        plan_id = next_workout.get("atpPlanId") or today_workout.get("atpPlanId")
-        goal_events = (
-            (await self._safe_call(self.get_calendar_events_for_plan, plan_id) or [])
-            if plan_id
-            else []
+        # Goal event: the plan's own target race, else the primary event,
+        # else the soonest race. atpPlanId (not the item's own trainingPlanId,
+        # observed as a stale 0) is the plan id the events carry.
+        plan_id = next(
+            (w["atpPlanId"] for w in scheduled_workouts if w.get("atpPlanId")),
+            None,
         )
-        goal_event = _trim_goal_event(goal_events[0]) if goal_events else {}
+        upcoming = (
+            await self._cached_safe_call("upcoming_events", self.get_upcoming_events)
+            or []
+        )
+        goal_event = _pick_goal_event(upcoming, plan_id)
 
         return {
             "lastActivities": trimmed_activities,
@@ -2888,6 +3445,7 @@ class GarminClient:
             "todayScheduledWorkout": today_workout,
             "nextScheduledWorkout": next_workout,
             "trainingPlanGoalEvent": goal_event,
+            "upcomingEvents": [_trim_goal_event(e) for e in upcoming],
         }
 
     async def fetch_training_data(
@@ -2897,13 +3455,15 @@ class GarminClient:
 
         API calls: get_training_readiness, get_morning_training_readiness,
                    get_training_status, get_lactate_threshold, get_endurance_score,
-                   get_hill_score, get_hrv_data, get_power_to_weight (8 calls)
+                   get_hill_score, get_hrv_data, get_power_to_weight (8 calls),
+                   plus get_user_settings and get_activities when training
+                   status has no VO2 Max
 
         After midnight, today's training data may not be ready yet.  For fields
         that go stale (training_status, HRV, scores) we fall back to yesterday.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         yesterday_date = target_date - timedelta(days=1)
         provenance = FetchProvenance(target_date)
@@ -2918,12 +3478,7 @@ class GarminClient:
 
         # Training status — fall back to yesterday if today's is empty or has no VO2Max
         def _has_vo2max(ts: dict[str, Any] | None) -> bool:
-            return bool(
-                ts
-                and ((ts.get("mostRecentVO2Max") or {}).get("generic") or {}).get(
-                    "vo2MaxValue"
-                )
-            )
+            return bool(ts and _vo2max_sport_entry(ts.get("mostRecentVO2Max") or {}))
 
         training_status = await provenance.read(
             "trainingStatus", self.get_training_status, target_date
@@ -2996,8 +3551,15 @@ class GarminClient:
         }
         result = _add_computed_fields(data)
 
-        # Fall back to last activity's vO2MaxValue if training status has none.
-        # Some devices never populate mostRecentVO2Max in the training status API.
+        # Some devices never populate mostRecentVO2Max in the training status
+        # API. Fall back to the profile's own VO2 Max, then to the last
+        # activities' vO2MaxValue.
+        if not result.get("vo2MaxValue"):
+            user_settings = await self._safe_call(self.get_user_settings) or {}
+            user_data = user_settings.get("userData") or {}
+            result["vo2MaxValue"] = user_data.get("vo2MaxRunning") or user_data.get(
+                "vo2MaxCycling"
+            )
         if not result.get("vo2MaxValue"):
             activities = await self._safe_call(self.get_activities, 0, 10)
             if activities:
@@ -3039,7 +3601,7 @@ class GarminClient:
         API calls: get_body_composition, get_hydration_data, get_fitness_age (3 calls)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         body_composition = await self._safe_call(self.get_body_composition, target_date)
         body_composition = body_composition or {}
@@ -3058,9 +3620,10 @@ class GarminClient:
         return _add_computed_fields(data)
 
     async def fetch_goals_data(self) -> dict[str, Any]:
-        """Fetch goals data: goals, badges.
+        """Fetch goals data: goals, badges, lifetime totals.
 
-        API calls: get_goals×3, get_earned_badges (4 calls)
+        API calls: get_goals×3, get_earned_badges (4 calls), plus
+                   get_lifetime_totals at most once an hour
         """
         active_goals = await self._safe_call(self.get_goals, "active")
         future_goals = await self._safe_call(self.get_goals, "future")
@@ -3114,76 +3677,72 @@ class GarminClient:
             "badges": badges,
             "userPoints": user_points,
             "userLevel": user_level,
+            "lifetimeTotals": await self._cached_safe_call(
+                "lifetime_totals", self.get_lifetime_totals
+            )
+            or {},
         }
 
     async def fetch_gear_data(self, timezone: str | None = None) -> dict[str, Any]:
         """Fetch gear data: gear, defaults, stats, alarms, solar, devices, sensors.
 
-        API calls: get_gear, get_gear_defaults, get_gear_stats×N,
+        API calls: get_gear_list (usage totals included), get_gear_defaults,
                    get_devices, get_device_alarms, get_device_solar_data×N,
                    get_device_last_used, get_sensors
         """
-        # Get user profile ID for gear API
+        gear = await self._safe_call(self.get_gear_list) or []
+        gear_defaults: list[dict[str, Any]] = []
         profile = await self._safe_call(self.get_user_profile)
-        user_profile_id = profile.profile_id if profile else None
-
-        gear: list[dict[str, Any]] = []
-        gear_stats: list[dict[str, Any]] = []
-        gear_defaults: dict[str, Any] = {}
-
-        if user_profile_id:
-            gear = await self._safe_call(self.get_gear, user_profile_id) or []
+        if gear and profile:
             gear_defaults = (
-                await self._safe_call(self.get_gear_defaults, user_profile_id) or {}
+                await self._safe_call(self.get_gear_defaults, profile.profile_id) or []
             )
 
-            activity_type_names = {
-                1: "running",
-                2: "cycling",
-                3: "walking",
-                4: "hiking",
-                5: "swimming",
-                6: "gym",
-                7: "yoga",
-                9: "other",
-            }
-            gear_default_activities: dict[str, list[str]] = {}
-            if isinstance(gear_defaults, list):
-                for default in gear_defaults:
-                    uuid = default.get("uuid")
-                    activity_pk = default.get("activityTypePk")
-                    if uuid and activity_pk and default.get("defaultGear"):
-                        if uuid not in gear_default_activities:
-                            gear_default_activities[uuid] = []
-                        activity_name = activity_type_names.get(
-                            activity_pk, f"type_{activity_pk}"
-                        )
-                        gear_default_activities[uuid].append(activity_name)
+        gear_default_activities: dict[str, list[str]] = {}
+        for default in gear_defaults:
+            uuid = default.get("uuid")
+            activity_pk = default.get("activityTypePk")
+            if uuid and activity_pk and default.get("defaultGear"):
+                gear_default_activities.setdefault(_undashed_uuid(uuid), []).append(
+                    _GEAR_ACTIVITY_TYPE_NAMES.get(activity_pk, f"type_{activity_pk}")
+                )
 
-            if gear:
-                for gear_item in gear:
-                    gear_uuid = gear_item.get("uuid")
-                    if gear_uuid:
-                        stats = await self._safe_call(self.get_gear_stats, gear_uuid)
-                        if stats:
-                            stats["gearUuid"] = gear_uuid
-                            stats["gearName"] = gear_item.get("displayName", "Unknown")
-                            stats["gearTypeName"] = gear_item.get(
-                                "gearTypeName", "Unknown"
-                            )
-                            stats["gearStatusName"] = gear_item.get(
-                                "gearStatusName", "active"
-                            )
-                            stats["gearMakeName"] = gear_item.get("gearMakeName")
-                            stats["gearModelName"] = gear_item.get("gearModelName")
-                            stats["customMakeModel"] = gear_item.get("customMakeModel")
-                            stats["dateBegin"] = gear_item.get("dateBegin")
-                            stats["dateEnd"] = gear_item.get("dateEnd")
-                            stats["maximumMeters"] = gear_item.get("maximumMeters")
-                            stats["defaultForActivity"] = gear_default_activities.get(
-                                gear_uuid, []
-                            )
-                            gear_stats.append(stats)
+        gear_stats: list[dict[str, Any]] = []
+        for item in gear:
+            raw_uuid = item.get("uuid")
+            if not isinstance(raw_uuid, str) or not raw_uuid:
+                continue
+            # Legacy undashed uuid: entity ids built from it stay stable.
+            uuid = _undashed_uuid(raw_uuid)
+            brand, model = item.get("brand"), item.get("model")
+            status = item.get("status")
+            gear_type = item.get("gearType")
+            gear_stats.append(
+                {
+                    "uuid": uuid,
+                    "gearUuid": uuid,
+                    "gearName": item.get("name") or "Unknown",
+                    "gearTypeName": gear_type.capitalize()
+                    if isinstance(gear_type, str)
+                    else "Unknown",
+                    "gearStatusName": status.lower()
+                    if isinstance(status, str)
+                    else "active",
+                    "gearMakeName": brand,
+                    "gearModelName": model,
+                    "customMakeModel": " ".join(p for p in (brand, model) if p) or None,
+                    "dateBegin": item.get("firstUseDate"),
+                    "dateEnd": None,
+                    "maximumMeters": item.get("maxUsageDistanceMeters"),
+                    "maximumSeconds": item.get("maxUsageDurationSeconds"),
+                    "totalDistance": item.get("distanceUsedMeters"),
+                    "totalDurationSeconds": item.get("durationUsedSeconds"),
+                    "totalActivities": item.get("numActivitiesLinked"),
+                    "daysUsed": item.get("daysUsed"),
+                    "notes": item.get("notes"),
+                    "defaultForActivity": gear_default_activities.get(uuid, []),
+                }
+            )
 
         # Devices (shared by alarms and solar)
         devices = await self._safe_call(self.get_devices) or []
@@ -3209,8 +3768,8 @@ class GarminClient:
             readings = dtos[0].get("solarInputReadings") or []
             # A single "latest" reading only reflects solar conditions at the
             # moment of the last sync, which can be way off from the day as a
-            # whole -- e.g. syncing at night reads ~0% even on a sunny day
-            # (home-assistant-garmin_connect#508). Aggregate the full day's
+            # whole -- e.g. syncing at night reads ~0% even on a sunny day.
+            # Aggregate the full day's
             # readings too, which cost nothing extra: they're already in the
             # same response.
             latest = None
@@ -3274,7 +3833,7 @@ class GarminClient:
         API calls: get_blood_pressure (1 call)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         blood_pressure_data: dict[str, Any] = {}
         # 365-day window: BP is logged manually and often infrequently; a
@@ -3329,7 +3888,7 @@ class GarminClient:
         API calls: get_menstrual_data, get_menstrual_calendar (2 calls)
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         menstrual_data = await self._safe_call(self.get_menstrual_data, target_date)
         menstrual_data = menstrual_data or {}
@@ -3352,7 +3911,7 @@ class GarminClient:
         Returns {} when the account has no Connect+ nutrition setup.
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = self.today()
 
         log = await self._safe_call(self.get_nutrition_log, target_date)
         if not log:
