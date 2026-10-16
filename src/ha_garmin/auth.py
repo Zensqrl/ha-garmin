@@ -85,9 +85,13 @@ def token_file_path(path: str | Path) -> Path:
     # ~/.garminconnect -> /attacker/dir). O_NOFOLLOW on the final open()
     # only covers the last component; an intermediate symlinked directory
     # would still redirect load/save into an attacker-controlled tree.
+    # Root-owned symlinks (e.g. /home -> var/home on Fedora Silverblue and
+    # FreeBSD) are allowed: an unprivileged attacker cannot plant one.
     for check_path in (token_path, *token_path.parents):
         try:
-            if check_path.is_symlink():
+            if check_path.is_symlink() and not (
+                os.name == "posix" and check_path.lstat().st_uid == 0
+            ):
                 raise ValueError(f"Token path must not be a symlink: {path_str!r}")
         except OSError as e:
             raise ValueError(
@@ -398,6 +402,10 @@ class GarminAuth:
 
         last_err: Exception | None = None
         rate_limited_count = 0
+        # Earlier strategies failing is expected (later ones usually work), so
+        # per-strategy failures are logged at debug and summarized in the
+        # final error when every strategy fails.
+        failures: list[str] = []
 
         for name, run in strategies:
             try:
@@ -407,7 +415,7 @@ class GarminAuth:
                 # region specific). Verify before accepting; otherwise fall
                 # through to the next strategy.
                 if not self._verify_token():
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "%s obtained a token the API rejected; trying next strategy",
                         name,
                     )
@@ -416,6 +424,7 @@ class GarminAuth:
                             f"{name}: token rejected by API tier"
                         )
                     )
+                    failures.append(f"{name}: token rejected")
                     self._clear_auth_state()
                     continue
                 return result
@@ -423,17 +432,18 @@ class GarminAuth:
                 # Bad credentials or MFA needed — stop immediately.
                 raise
             except GarminRateLimitError as e:
-                _LOGGER.warning(
-                    "%s returned 429: %s", name, _sanitize_exception_text(e)
-                )
+                _LOGGER.debug("%s returned 429: %s", name, _sanitize_exception_text(e))
                 rate_limited_count += 1
                 last_err = e
+                failures.append(f"{name}: 429")
                 continue
             except Exception as e:
-                _LOGGER.warning("%s failed: %s", name, _sanitize_exception_text(e))
+                _LOGGER.debug("%s failed: %s", name, _sanitize_exception_text(e))
                 last_err = e
+                failures.append(f"{name}: {type(e).__name__}")
                 continue
 
+        summary = "; ".join(failures)
         if rate_limited_count == len(strategies):
             raise GarminRateLimitError(
                 "All login strategies rate limited (429). "
@@ -441,13 +451,9 @@ class GarminAuth:
                 "rate limiting; try again later or from another network."
             )
         raise GarminAPIError(
-            "All login strategies exhausted: "
+            f"All login strategies exhausted ({summary}): "
             + (_sanitize_exception_text(last_err) if last_err else "no strategies ran")
         )
-
-    # ------------------------------------------------------------------ #
-    #  STRATEGY 1 — Mobile iOS + curl_cffi (TLS fingerprint rotation)     #
-    # ------------------------------------------------------------------ #
 
     def _mobile_login_cffi(self, email: str, password: str) -> AuthResult:
         """Mobile login with curl_cffi TLS fingerprint rotation.

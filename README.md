@@ -111,10 +111,10 @@ Optimized methods that group related API calls for Home Assistant coordinators:
 | ------ | --------- | ------------- |
 | `fetch_core_data()` | 3 | Steps, distance, calories, HR, stress, sleep, skin temperature change, body battery, SPO2 |
 | `fetch_body_data()` | 3 | Weight, BMI, body fat, hydration, fitness age |
-| `fetch_activity_data()` | 6+ | Activities, workouts, HR zones, polylines, training calendar (scheduled workouts, plan goal event or calendar race) |
-| `fetch_training_data()` | 8+ | Training readiness, status, VO2 Max, HRV, lactate, endurance/hill scores, power-to-weight |
-| `fetch_goals_data()` | 4 | Goals (active/future/history), badges, user level |
-| `fetch_gear_data()` | 6+ | Gear items, stats, device alarms, solar intensity (daily avg + gain), devices, last sync, paired sensors |
+| `fetch_activity_data()` | 7+ | Activities, workouts, HR zones, polylines, training calendar (scheduled workouts), upcoming events and the plan goal event |
+| `fetch_training_data()` | 8+ | Training readiness, status, VO2 Max (running and cycling), heat/altitude acclimation, HRV, lactate, endurance/hill scores, power-to-weight |
+| `fetch_goals_data()` | 5 | Goals (active/future/history), badges, user level, lifetime totals |
+| `fetch_gear_data()` | 6+ | Gear items with usage totals and notes (gear v2, no per-item stats calls), device alarms, solar intensity (daily avg + gain), devices, last sync, paired sensors |
 | `fetch_blood_pressure_data()` | 1 | Blood pressure measurements |
 | `fetch_menstrual_data()` | 2 | Menstrual cycle data |
 | `fetch_nutrition_data()` | 1 | Nutrition log: consumed macros, goals, per-meal breakdown |
@@ -162,7 +162,7 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | `get_user_profile()` | User profile info |
 | `get_user_settings()` | Profile settings (`userData`, incl. VO2 Max running/cycling) |
 | `get_daily_steps()` | Steps for date range |
-| `get_body_composition()` | Weight, BMI, body fat |
+| `get_body_composition()` | Latest weigh-in: weight, BMI, body fat |
 | `get_fitness_age()` | Fitness age metrics |
 | `get_hydration_data()` | Daily hydration |
 | `get_activities()` | Most recent activities (newest first, no date filter) |
@@ -173,6 +173,7 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | `download_activity(activity_id, file_format)` | Download activity file (fit/original/tcx/gpx/kml/csv) |
 | `get_workouts()` | Workout library (created/saved workouts, not when scheduled) |
 | `get_scheduled_workouts(year, month)` | Training calendar for a month: self-scheduled + Garmin Coach / adaptive-plan workouts |
+| `get_upcoming_events(days_forward, limit)` | Upcoming races and plan goal events, with projected/predicted race times |
 | `get_training_readiness()` | Training readiness score |
 | `get_training_status()` | Training status |
 | `get_morning_training_readiness()` | Morning readiness |
@@ -182,8 +183,9 @@ The method automatically fetches the correct meal slot ID and time for the day. 
 | `get_power_to_weight(target_date)` | FTP / power-to-weight data |
 | `get_goals()` | User goals by status |
 | `get_earned_badges()` | Earned badges |
-| `get_gear()` | User gear items |
-| `get_gear_stats()` | Gear statistics |
+| `get_lifetime_totals()` | Lifetime distance, steps, calories and active days |
+| `get_gear_list()` | Active and retired gear with usage totals and notes (gear v2) |
+| `get_gear_details(gear_uuid)` | One piece of gear, including its default activity types (gear v2) |
 | `get_gear_defaults()` | Default gear settings |
 | `get_devices()` | Connected devices |
 | `get_sensors()` | Paired ANT+/BLE sensors and battery status |

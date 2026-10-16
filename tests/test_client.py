@@ -10,6 +10,9 @@ import pytest
 from ha_garmin import GarminAuth, GarminClient
 from ha_garmin.const import GARMIN_CONNECT_API
 from ha_garmin.exceptions import GarminAPIError, GarminAuthError, GarminTLSError
+from ha_garmin.models import UserProfile
+
+_PROFILE = UserProfile(id=1, profileId=82413233, displayName="tester")
 
 
 def _make_auth(di_token: str = "fake_di_token") -> GarminAuth:
@@ -216,20 +219,20 @@ class TestGarminClient:
         with pytest.raises(ValueError):
             await client.get_adaptive_training_plan_by_id(0)
 
-    async def test_get_calendar_events_for_plan_passes_training_plan_id(self):
+    async def test_get_upcoming_events_params(self):
         from ha_garmin.const import CALENDAR_EVENTS_URL
 
-        auth = _make_auth()
-        client = GarminClient(auth)
-
+        client = GarminClient(_make_auth())
         payload = [{"id": 29937926, "eventName": "5K Plan"}]
         with patch.object(client, "_request", new_callable=AsyncMock) as mock_req:
             mock_req.return_value = payload
-            result = await client.get_calendar_events_for_plan(1789148356)
+            result = await client.get_upcoming_events()
 
         assert result == payload
         mock_req.assert_awaited_once_with(
-            "GET", CALENDAR_EVENTS_URL, params={"trainingPlanId": 1789148356}
+            "GET",
+            f"{CALENDAR_EVENTS_URL}/upcoming",
+            params={"numDaysForward": 365, "limit": 10},
         )
 
     async def test_fetch_activity_data_includes_scheduled_workouts(self):
@@ -287,6 +290,7 @@ class TestGarminClient:
                 "eventType": "running",
                 "completionTarget": {"value": 5.0, "unit": "kilometer"},
                 "eventCustomization": {
+                    "trainingPlanId": 222,
                     "trainingPlanType": "COACH_ATP",
                     "projectedRaceTimeDurationSeconds": 1829,
                     "predictedRaceTimeDurationSeconds": 2101,
@@ -309,7 +313,7 @@ class TestGarminClient:
                 side_effect=fake_get_scheduled_workouts,
             ) as mock_calendar,
             patch.object(
-                client, "get_calendar_events_for_plan", new_callable=AsyncMock
+                client, "get_upcoming_events", new_callable=AsyncMock
             ) as mock_goal,
         ):
             mock_acts.return_value = []
@@ -325,7 +329,7 @@ class TestGarminClient:
         assert data["nextScheduledWorkout"]["title"] == "Benchmark Run"
         assert data["nextScheduledWorkout"]["atpPlanId"] == 222
 
-        mock_goal.assert_awaited_once_with(222)
+        mock_goal.assert_awaited_once_with()
         assert data["trainingPlanGoalEvent"]["eventName"] == "5K Plan"
         assert data["trainingPlanGoalEvent"]["targetDistance"] == 5.0
         assert data["trainingPlanGoalEvent"]["targetDistanceUnit"] == "kilometer"
@@ -341,7 +345,7 @@ class TestGarminClient:
         """Fake `_request` that answers only the calendar endpoints.
 
         Everything above the HTTP layer (get_scheduled_workouts,
-        get_calendar_events_for_plan, the filtering in fetch_activity_data)
+        get_upcoming_events, the filtering in fetch_activity_data)
         runs for real. Other endpoints fetch_activity_data touches get [].
         """
         from ha_garmin.const import CALENDAR_EVENTS_URL, CALENDAR_URL
@@ -354,7 +358,7 @@ class TestGarminClient:
                 year, zero_based_month = int(match[1]), int(match[2])
                 items = calendar_items_by_month.get((year, zero_based_month + 1), [])
                 return {"calendarItems": items}
-            if url == CALENDAR_EVENTS_URL:
+            if url == f"{CALENDAR_EVENTS_URL}/upcoming":
                 if events_params is not None:
                     events_params.append(params)
                 return goal_events or []
@@ -402,8 +406,7 @@ class TestGarminClient:
         assert data["scheduledWorkouts"] == [expected]
         assert data["todayScheduledWorkout"] == expected
         assert data["nextScheduledWorkout"] == expected
-        # No atpPlanId on the item, so there is no goal event to look up.
-        assert events_params == []
+        assert events_params == [{"numDaysForward": 365, "limit": 10}]
         assert data["trainingPlanGoalEvent"] == {}
 
     async def test_fetch_activity_data_goal_event_survives_fbt_first(self):
@@ -440,11 +443,19 @@ class TestGarminClient:
         }
         goal_events = [
             {
+                "eventName": "Primary 10K",
+                "date": "2026-11-01",
+                "eventCustomization": {"isPrimaryEvent": True},
+            },
+            {
                 "eventName": "5K Plan",
                 "date": "2026-11-21",
                 "completionTarget": {"value": 5.0, "unit": "kilometer"},
-                "eventCustomization": {"trainingPlanType": "COACH_ATP"},
-            }
+                "eventCustomization": {
+                    "trainingPlanId": 222,
+                    "trainingPlanType": "COACH_ATP",
+                },
+            },
         ]
 
         events_params: list[dict] = []
@@ -462,45 +473,39 @@ class TestGarminClient:
         ]
         assert data["todayScheduledWorkout"]["title"] == "Basis"
         assert data["nextScheduledWorkout"]["title"] == "Basis"
-        assert events_params == [{"trainingPlanId": 222}]
+        assert len(events_params) == 1
         assert data["trainingPlanGoalEvent"]["eventName"] == "5K Plan"
         assert data["trainingPlanGoalEvent"]["trainingPlanType"] == "COACH_ATP"
 
     @staticmethod
-    def _race_item(title: str, day: date, primary: bool) -> dict:
+    def _event(title: str, day: date, primary: bool, race: bool = True, plan=None):
         return {
-            "itemType": "event",
-            "title": title,
+            "eventName": title,
             "date": day.isoformat(),
-            "isRace": True,
-            "primaryEvent": primary,
+            "eventType": "running",
+            "race": race,
             "completionTarget": {
                 "value": 42195.0,
                 "unit": "meter",
                 "unitType": "distance",
             },
+            "eventCustomization": {
+                "isPrimaryEvent": primary,
+                "trainingPlanId": plan,
+                "projectedRaceTimeDurationSeconds": 12600 if plan else None,
+            },
         }
 
-    async def test_fetch_activity_data_goal_event_falls_back_to_primary_race(self):
-        """Without a plan goal event, the calendar's race stands in for it.
-
-        The primary race wins over a sooner non-primary one; past races and
-        non-race events are ignored. No extra request is made.
-        """
-        auth = _make_auth()
-        client = GarminClient(auth)
-
+    async def test_fetch_activity_data_goal_event_falls_back_to_primary_event(self):
+        """Without a plan goal event, the primary event wins over a sooner race."""
+        client = GarminClient(_make_auth())
         today = date.today()
-        items = [
-            self._race_item("Old Race", today - timedelta(days=1), primary=True),
-            self._race_item("Parkrun", today, primary=False),
-            self._race_item("TCS Amsterdam Marathon", today + timedelta(days=2), True),
-            {**self._race_item("Club Social", today, False), "isRace": False},
+        events = [
+            self._event("Parkrun", today, primary=False),
+            self._event("TCS Amsterdam Marathon", today + timedelta(days=2), True),
+            self._event("Club Social", today, False, race=False),
         ]
-        events_params: list[dict] = []
-        fake_request = self._calendar_request_router(
-            {(today.year, today.month): items}, events_params=events_params
-        )
+        fake_request = self._calendar_request_router({}, goal_events=events)
         with patch.object(client, "_request", side_effect=fake_request):
             data = await client.fetch_activity_data()
 
@@ -510,33 +515,32 @@ class TestGarminClient:
         assert goal["targetDistance"] == 42195.0
         assert goal["targetDistanceUnit"] == "meter"
         assert goal["primaryEvent"] is True
-        assert goal["trainingPlanType"] is None
-        assert events_params == []
-        # Races are not scheduled workouts.
+        assert [e["eventName"] for e in data["upcomingEvents"]] == [
+            "Parkrun",
+            "TCS Amsterdam Marathon",
+            "Club Social",
+        ]
         assert data["scheduledWorkouts"] == []
 
     async def test_fetch_activity_data_race_fallback_soonest_without_primary(self):
-        """With no primary race, the soonest upcoming race is used."""
-        auth = _make_auth()
-        client = GarminClient(auth)
-
+        """With no primary event, the soonest race is used; non-races are not."""
+        client = GarminClient(_make_auth())
         today = date.today()
-        items = [
-            self._race_item("Later", today + timedelta(days=3), primary=False),
-            self._race_item("Sooner", today + timedelta(days=1), primary=False),
+        events = [
+            self._event("Social", today, False, race=False),
+            self._event("Later", today + timedelta(days=3), primary=False),
+            self._event("Sooner", today + timedelta(days=1), primary=False),
         ]
-        fake_request = self._calendar_request_router({(today.year, today.month): items})
+        fake_request = self._calendar_request_router({}, goal_events=events)
         with patch.object(client, "_request", side_effect=fake_request):
             data = await client.fetch_activity_data()
 
         assert data["trainingPlanGoalEvent"]["eventName"] == "Sooner"
         assert data["trainingPlanGoalEvent"]["primaryEvent"] is False
 
-    async def test_fetch_activity_data_plan_goal_event_beats_calendar_race(self):
-        """A plan's own goal event (with projections) takes precedence."""
-        auth = _make_auth()
-        client = GarminClient(auth)
-
+    async def test_fetch_activity_data_plan_goal_event_beats_primary_event(self):
+        """The plan's own goal event (with projections) takes precedence."""
+        client = GarminClient(_make_auth())
         today = date.today()
         atp_workout = {
             "id": 1,
@@ -545,22 +549,19 @@ class TestGarminClient:
             "date": today.isoformat(),
             "atpPlanId": 222,
         }
-        race = self._race_item("Some Race", today + timedelta(days=1), primary=True)
-        goal_events = [
-            {
-                "eventName": "Plan Marathon",
-                "date": "2026-11-21",
-                "eventCustomization": {"trainingPlanType": "COACH_ATP"},
-            }
+        events = [
+            self._event("Some Race", today + timedelta(days=1), primary=True),
+            self._event("Plan Marathon", today + timedelta(days=30), False, plan=222),
         ]
         fake_request = self._calendar_request_router(
-            {(today.year, today.month): [atp_workout, race]}, goal_events=goal_events
+            {(today.year, today.month): [atp_workout]}, goal_events=events
         )
         with patch.object(client, "_request", side_effect=fake_request):
             data = await client.fetch_activity_data()
 
-        assert data["trainingPlanGoalEvent"]["eventName"] == "Plan Marathon"
-        assert "primaryEvent" not in data["trainingPlanGoalEvent"]
+        goal = data["trainingPlanGoalEvent"]
+        assert goal["eventName"] == "Plan Marathon"
+        assert goal["projectedRaceTimeDurationSeconds"] == 12600
 
     async def test_fetch_activity_data_uses_recency_not_window(self):
         """Test fetch_activity_data returns lastActivity even for old activities."""
@@ -595,6 +596,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [old_activity]
             mock_workouts.return_value = []
@@ -648,6 +652,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = activities
             mock_workouts.return_value = []
@@ -696,6 +703,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [ride]
             mock_summary.return_value = summary
@@ -756,6 +766,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [ride]
             mock_workouts.return_value = []
@@ -812,6 +825,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [ride]
             mock_summary.return_value = {"activityId": 10}
@@ -897,6 +913,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [row]
             mock_summary.return_value = summary
@@ -964,6 +983,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [walk]
             mock_summary.return_value = {"activityId": 12, "connectIQMeasurements": []}
@@ -1035,6 +1057,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_scheduled_workouts", new_callable=AsyncMock
             ) as mock_calendar,
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
         ):
             mock_acts.return_value = [run]
             mock_summary.return_value = {"activityId": 8, "eBikeBatteryRemaining": 42}
@@ -1615,57 +1640,27 @@ class TestGarminClient:
         with pytest.raises(GarminTLSError):
             await client._safe_call(failing)
 
-    async def test_get_body_composition_uses_daily_weight_summaries(self):
-        """Test get_body_composition returns latest weight from dailyWeightSummaries."""
-        auth = _make_auth()
-        client = GarminClient(auth)
+    async def test_get_body_composition_uses_latest_weigh_in(self):
+        """Body composition is the latest weigh-in, as the web app reads it."""
+        client = GarminClient(_make_auth())
+        # "date" is local wall-clock ms: 2026-10-16T13:02:54 local.
+        payload = {"date": 1792146174277, "weight": 87910.0, "bmi": 26.0}
+        client._request = AsyncMock(return_value=payload)
 
-        payload = {
-            "dailyWeightSummaries": [
-                {
-                    "summaryDate": "2026-04-01",
-                    "latestWeight": {
-                        "calendarDate": "2026-04-01",
-                        "weight": 85000.0,
-                        "bmi": 25.0,
-                    },
-                },
-                {
-                    "summaryDate": "2026-04-03",
-                    "latestWeight": {
-                        "calendarDate": "2026-04-03",
-                        "weight": 87000.0,
-                        "bmi": 26.0,
-                    },
-                },
-            ],
-            "totalAverage": {"weight": 86000.0, "bmi": 25.5},
-        }
+        result = await client.get_body_composition(date(2026, 10, 16))
 
-        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
-            mock_thread.return_value = _mock_response(payload)
-            result = await client.get_body_composition()
-
-        # Should pick the most recent by calendarDate
-        assert result["weight"] == 87000.0
+        assert result["weight"] == 87910.0
         assert result["bmi"] == 26.0
-
-    async def test_get_body_composition_falls_back_to_total_average(self):
-        """Test get_body_composition falls back to totalAverage when no summaries."""
-        auth = _make_auth()
-        client = GarminClient(auth)
-
-        payload = {
-            "dailyWeightSummaries": [],
-            "totalAverage": {"weight": 86000.0, "bmi": 25.5},
+        assert result["calendarDate"] == "2026-10-16"
+        assert client._request.call_args.kwargs["params"] == {
+            "date": "2026-10-16",
+            "ignorePriority": "true",
         }
 
-        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
-            mock_thread.return_value = _mock_response(payload)
-            result = await client.get_body_composition()
-
-        assert result["weight"] == 86000.0
-        assert result["bmi"] == 25.5
+    async def test_get_body_composition_empty_without_weigh_in(self):
+        client = GarminClient(_make_auth())
+        client._request = AsyncMock(return_value={"weight": None})
+        assert await client.get_body_composition() == {}
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -1683,16 +1678,9 @@ class TestGarminClient:
         client = GarminClient(auth)
 
         payload = {
-            "dailyWeightSummaries": [
-                {
-                    "summaryDate": "2026-04-03",
-                    "latestWeight": {
-                        "calendarDate": "2026-04-03",
-                        "weight": 87000.0,
-                        "metabolicAge": raw,
-                    },
-                },
-            ],
+            "calendarDate": "2026-04-03",
+            "weight": 87000.0,
+            "metabolicAge": raw,
         }
 
         with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
@@ -1964,6 +1952,7 @@ class TestGarminClient:
         """A timestamp with no milliseconds must still be accepted and padded to .000."""
         auth = _make_auth()
         client = GarminClient(auth)
+        client._profile_cache = _PROFILE
 
         put_payloads = []
 
@@ -1982,6 +1971,7 @@ class TestGarminClient:
         """A timestamp that already has sub-second precision keeps millisecond precision."""
         auth = _make_auth()
         client = GarminClient(auth)
+        client._profile_cache = _PROFILE
 
         put_payloads = []
 
@@ -2000,6 +1990,7 @@ class TestGarminClient:
         """Omitting the timestamp still produces a millisecond-precision value."""
         auth = _make_auth()
         client = GarminClient(auth)
+        client._profile_cache = _PROFILE
 
         put_payloads = []
 
@@ -2020,6 +2011,7 @@ class TestGarminClient:
         """set_hydration sends a PUT with calendarDate/timestampLocal/valueInML."""
         auth = _make_auth()
         client = GarminClient(auth)
+        client._profile_cache = _PROFILE
 
         put_payloads = []
 
@@ -2045,6 +2037,7 @@ class TestGarminClient:
         """Values beyond +/-10000 mL must raise ValueError before any request is made."""
         auth = _make_auth()
         client = GarminClient(auth)
+        client._profile_cache = _PROFILE
         client._put_request = AsyncMock()
 
         with pytest.raises(ValueError, match="10000"):
@@ -2283,13 +2276,13 @@ class TestGarminClient:
             )
 
     async def test_get_menstrual_calendar_clamps_end_date(self):
-        """Test get_menstrual_calendar clamps end_date to a maximum of 92 days."""
+        """Garmin rejects 92+ inclusive days, so the window is clamped to 90."""
         auth = _make_auth()
         client = GarminClient(auth)
 
         start_date = date(2026, 1, 1)
         end_date = date(2026, 12, 31)
-        expected_clamped_date = start_date + timedelta(days=92)
+        expected_clamped_date = start_date + timedelta(days=89)
 
         with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
             mock_request.return_value = {"status": "ok"}
@@ -2309,7 +2302,7 @@ class TestGarminClient:
         client = GarminClient(auth)
 
         start_date = date(2026, 5, 8)
-        end_date = date(2026, 8, 6)  # Exactly 90 days diff
+        end_date = date(2026, 8, 5)  # 90 days inclusive, the maximum
 
         with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
             mock_request.return_value = {"status": "ok"}
@@ -2383,7 +2376,7 @@ class TestGarminClient:
     @pytest.mark.parametrize(
         "method,args",
         [
-            ("get_gear_stats", ("../../../etc/passwd",)),
+            ("get_gear_details", ("../../../etc/passwd",)),
             ("set_active_gear", ("running", "set as default", "not-a-uuid")),
             ("add_gear_to_activity", ("bad-uuid", 12345)),
         ],
@@ -2402,10 +2395,11 @@ class TestGarminClient:
         client = GarminClient(auth)
 
         with patch.object(client, "_request", new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = {"gearStats": {}}
-            await client.get_gear_stats("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
-            assert (
-                "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" in mock_request.call_args[0][1]
+            mock_request.return_value = {}
+            # Undashed legacy uuids are dashed for gear v2.
+            await client.get_gear_details("a0eebc999c0b4ef8bb6d6bb9bd380a11")
+            assert mock_request.call_args[0][1].endswith(
+                "/v2/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
             )
 
 
@@ -2522,7 +2516,7 @@ class TestSecurityAuditHardening:
 
         with (
             patch.object(client, "get_user_profile", return_value=profile),
-            patch.object(client, "get_gear", return_value=[]),
+            patch.object(client, "get_gear_list", return_value=[]),
             patch.object(client, "get_gear_defaults", return_value=[]),
             patch.object(client, "get_devices", return_value=[]),
             patch.object(client, "get_device_last_used", return_value={}),
@@ -2581,7 +2575,7 @@ class TestSecurityAuditHardening:
 
         with (
             patch.object(client, "get_user_profile", return_value=profile),
-            patch.object(client, "get_gear", return_value=[]),
+            patch.object(client, "get_gear_list", return_value=[]),
             patch.object(client, "get_gear_defaults", return_value=[]),
             patch.object(client, "get_devices", return_value=[device]),
             patch.object(client, "get_device_last_used", return_value={}),
@@ -2697,6 +2691,7 @@ class TestGarminCalendarZone:
 
     async def test_hydration_calendar_date_follows_timestamp(self):
         client = GarminClient(_make_auth(), timezone="Europe/Istanbul")
+        client._profile_cache = _PROFILE
         client._put_request = AsyncMock(return_value={})
         await client.set_hydration(250, timestamp="2026-04-17T23:30:00")
         payload = client._put_request.call_args.args[1]
@@ -2848,3 +2843,361 @@ class TestWorkoutWrites:
             await call(client)
         for mock in (client._post_request, client._put_request, client._delete_request):
             mock.assert_not_awaited()
+
+
+class TestWebAppParity:
+    """Requests match what the Garmin Connect web app sends."""
+
+    async def test_hydration_rejects_non_numbers(self):
+        client = GarminClient(_make_auth())
+        client._profile_cache = _PROFILE
+        client._put_request = AsyncMock(return_value={})
+        for bad in (True, float("nan"), float("inf"), "250"):
+            with pytest.raises(ValueError):
+                await client.set_hydration(bad)
+        client._put_request.assert_not_called()
+
+    async def test_hydration_sends_user_profile_id(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Amsterdam")
+        client._profile_cache = _PROFILE
+        client._put_request = AsyncMock(return_value={})
+        await client.set_hydration(250)
+        payload = client._put_request.call_args.args[1]
+        assert payload["userProfileId"] == _PROFILE.profile_id
+
+    async def test_hydration_cdate_alone_logs_at_midnight(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Amsterdam")
+        client._profile_cache = _PROFILE
+        client._put_request = AsyncMock(return_value={})
+        await client.set_hydration(250, cdate="2026-04-18")
+        payload = client._put_request.call_args.args[1]
+        assert payload["calendarDate"] == "2026-04-18"
+        assert payload["timestampLocal"] == "2026-04-18T00:00:00.000"
+
+    async def test_hydration_rejects_mismatched_cdate(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Amsterdam")
+        client._profile_cache = _PROFILE
+        client._put_request = AsyncMock(return_value={})
+        with pytest.raises(ValueError, match="doesn't match cdate"):
+            await client.set_hydration(
+                250, cdate="2026-04-18", timestamp="2026-04-19T08:00:00"
+            )
+
+    async def test_nutrition_log_requests_goals(self):
+        client = GarminClient(_make_auth())
+        client._request = AsyncMock(return_value={})
+        await client.get_nutrition_log(date(2026, 4, 18))
+        assert client._request.call_args.kwargs["params"] == {
+            "includeGoals": "true",
+            "includeNutrition": "true",
+        }
+
+    async def test_menstrual_day_view_sends_today_date(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Amsterdam")
+        client._request = AsyncMock(return_value={})
+        await client.get_menstrual_data(date(2026, 4, 1))
+        params = client._request.call_args.kwargs["params"]
+        assert params == {"todayDate": client.today().isoformat()}
+
+    async def test_menstrual_default_window_is_not_clamped(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Amsterdam")
+        client._request = AsyncMock(return_value={})
+        await client.get_menstrual_calendar()
+        today = client.today()
+        url = client._request.call_args.args[1]
+        assert url.endswith(
+            f"/{(today - timedelta(days=30)).isoformat()}"
+            f"/{(today + timedelta(days=59)).isoformat()}"
+        )
+
+    @pytest.mark.parametrize(
+        ("systolic", "diastolic", "pulse"),
+        [(300, 80, None), (120, 20, None), (120, 80, 10), (120.5, 80, None)],
+    )
+    async def test_blood_pressure_rejects_out_of_range(
+        self, systolic, diastolic, pulse
+    ):
+        client = GarminClient(_make_auth())
+        client._post_request = AsyncMock(return_value={})
+        with pytest.raises(ValueError):
+            await client.set_blood_pressure(systolic, diastolic, pulse)
+        client._post_request.assert_not_called()
+
+    def test_alarms_default_to_garmin_day_zone(self):
+        client = GarminClient(_make_auth(), timezone="Europe/Amsterdam")
+        alarms = [{"alarmMode": "ON", "alarmTime": 420, "alarmDays": ["ONCE"]}]
+        assert client._calculate_next_active_alarms(alarms, None)
+
+
+class TestUploadErrors:
+    """Upload failures keep Garmin's message and HTTP status."""
+
+    _DUPLICATE = {
+        "detailedImportResult": {
+            "failures": [{"messages": [{"content": "Duplicate Activity."}]}]
+        }
+    }
+
+    async def test_duplicate_after_403_retry_reports_message(self, tmp_path):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b"fit")
+        client = GarminClient(_make_auth())
+        client._auth.refresh_session = AsyncMock(return_value=True)
+        responses = [_mock_response({}, 403), _mock_response(self._DUPLICATE, 409)]
+        with (
+            patch("requests.post", side_effect=responses),
+            pytest.raises(GarminAPIError, match="Duplicate Activity") as exc,
+        ):
+            await client.upload_activity(str(fit))
+        assert exc.value.status_code == 409
+
+    async def test_non_text_messages_are_skipped(self, tmp_path):
+        fit = tmp_path / "ride.fit"
+        fit.write_bytes(b"fit")
+        client = GarminClient(_make_auth())
+        result = {
+            "detailedImportResult": {
+                "failures": [{"messages": [{"content": {"x": 1}}, {"content": "Bad"}]}]
+            }
+        }
+        with (
+            patch("requests.post", return_value=_mock_response(result, 500)),
+            pytest.raises(GarminAPIError, match=r"Upload failed: Bad$"),
+        ):
+            await client.upload_activity(str(fit))
+
+
+class TestGearV2:
+    """Gear comes from gear v2; output keeps the legacy shape and uuids."""
+
+    _V2 = [
+        {
+            "uuid": "a214d553-c175-4a04-9e8e-f0c812e5342b",
+            "gearType": "SHOES",
+            "status": "ACTIVE",
+            "name": "Brooks",
+            "brand": "Adrenaline GTS 21",
+            "maxUsageDistanceMeters": 643738.0,
+            "firstUseDate": "2021-05-14",
+            "numActivitiesLinked": 49,
+            "durationUsedSeconds": 110579,
+            "distanceUsedMeters": 89654.6,
+            "daysUsed": 45,
+            "notes": "My notes",
+        }
+    ]
+    _DEFAULTS = [
+        {
+            "uuid": "a214d553c1754a049e8ef0c812e5342b",
+            "activityTypePk": 1,
+            "defaultGear": True,
+        }
+    ]
+
+    async def test_fetch_gear_data_maps_v2_without_stats_calls(self):
+        client = GarminClient(_make_auth())
+        client._profile_cache = _PROFILE
+        with (
+            patch.object(client, "get_gear_list", return_value=self._V2),
+            patch.object(client, "get_gear_defaults", return_value=self._DEFAULTS),
+            patch.object(client, "get_devices", return_value=[]),
+            patch.object(client, "get_device_last_used", return_value={}),
+            patch.object(client, "get_device_alarms", return_value=[]),
+            patch.object(client, "get_sensors", return_value=[]),
+        ):
+            data = await client.fetch_gear_data()
+
+        (stat,) = data["gearStats"]
+        assert stat["uuid"] == stat["gearUuid"] == "a214d553c1754a049e8ef0c812e5342b"
+        assert stat["gearName"] == "Brooks"
+        assert stat["gearTypeName"] == "Shoes"
+        assert stat["gearStatusName"] == "active"
+        assert stat["totalDistance"] == 89654.6
+        assert stat["totalActivities"] == 49
+        assert stat["totalDurationSeconds"] == 110579
+        assert stat["maximumMeters"] == 643738.0
+        assert stat["customMakeModel"] == "Adrenaline GTS 21"
+        assert stat["notes"] == "My notes"
+        assert stat["defaultForActivity"] == ["running"]
+
+    async def test_set_active_gear_puts_full_v2_object(self):
+        client = GarminClient(_make_auth())
+        details = {
+            "uuid": "a214d553-c175-4a04-9e8e-f0c812e5342b",
+            "name": "Brooks",
+            "associatedActivityTypes": [
+                {
+                    "activityTypeKey": "hiking",
+                    "defaultGear": True,
+                    "preferredGear": False,
+                }
+            ],
+        }
+        client._request = AsyncMock(return_value=details)
+        client._put_request = AsyncMock(return_value={})
+
+        await client.set_active_gear(
+            "running", "set as default", "a214d553c1754a049e8ef0c812e5342b"
+        )
+
+        url, payload = client._put_request.call_args.args
+        assert url.endswith(
+            "/gear-service/gear/v2/a214d553-c175-4a04-9e8e-f0c812e5342b"
+        )
+        assert payload["name"] == "Brooks"
+        assert [a["activityTypeKey"] for a in payload["associatedActivityTypes"]] == [
+            "hiking",
+            "running",
+        ]
+
+    async def test_set_active_gear_unset_others(self):
+        client = GarminClient(_make_auth())
+        client._profile_cache = _PROFILE
+        target = "a214d553c1754a049e8ef0c812e5342b"
+        other = "bdcea3e8f70e40a78d50cd2fe5397798"
+        defaults = [
+            {"uuid": target, "activityTypePk": 1, "defaultGear": True},
+            {"uuid": other, "activityTypePk": 1, "defaultGear": True},
+            {"uuid": other, "activityTypePk": 4, "defaultGear": True},
+        ]
+        running = {
+            "activityTypeKey": "running",
+            "defaultGear": True,
+            "preferredGear": False,
+        }
+        hiking = {
+            "activityTypeKey": "hiking",
+            "defaultGear": True,
+            "preferredGear": False,
+        }
+
+        async def fake_request(method, url, params=None):
+            if url.endswith("/activityTypes"):
+                return defaults
+            return {
+                "uuid": url.rsplit("/", 1)[1],
+                "associatedActivityTypes": [running, hiking],
+            }
+
+        client._request = fake_request
+        client._put_request = AsyncMock(return_value={})
+
+        await client.set_active_gear(
+            "running", "set this as default, unset others", target
+        )
+
+        puts = {
+            c.args[0].rsplit("/", 1)[1]: c.args[1]
+            for c in client._put_request.call_args_list
+        }
+        assert len(puts) == 2
+        other_keys = [
+            a["activityTypeKey"]
+            for a in puts["bdcea3e8-f70e-40a7-8d50-cd2fe5397798"][
+                "associatedActivityTypes"
+            ]
+        ]
+        assert other_keys == ["hiking"]
+
+    async def test_set_active_gear_unknown_gear_raises(self):
+        client = GarminClient(_make_auth())
+        client._request = AsyncMock(return_value={})
+        with pytest.raises(GarminAPIError, match="not found"):
+            await client.set_active_gear("running", "unset default", "9" * 32)
+
+
+class TestTrainingAndGoalsAdditions:
+    def test_acclimation_and_cycling_vo2_from_training_status(self):
+        from ha_garmin.client import _add_computed_fields
+
+        result = _add_computed_fields(
+            {
+                "trainingStatus": {
+                    "mostRecentVO2Max": {
+                        "generic": {"vo2MaxValue": 36.0},
+                        "cycling": {"vo2MaxValue": 41.0},
+                        "heatAltitudeAcclimation": {
+                            "heatAcclimationPercentage": 35,
+                            "heatTrend": "ACCLIMATIZING",
+                            "altitudeAcclimation": 1200,
+                            "altitudeTrend": None,
+                            "currentAltitude": 1500,
+                        },
+                    }
+                }
+            }
+        )
+        assert result["vo2MaxValue"] == 36.0
+        assert result["vo2MaxCyclingValue"] == 41.0
+        assert result["heatAcclimationPercentage"] == 35
+        assert result["heatAcclimationTrend"] == "ACCLIMATIZING"
+        assert result["altitudeAcclimation"] == 1200
+        assert result["currentAltitude"] == 1500
+
+    async def test_lifetime_totals_uses_display_name(self):
+        from ha_garmin.const import LIFETIME_TOTALS_URL
+
+        client = GarminClient(_make_auth())
+        client._profile_cache = _PROFILE
+        client._request = AsyncMock(return_value={"totalSteps": 10428222})
+        assert await client.get_lifetime_totals() == {"totalSteps": 10428222}
+        client._request.assert_awaited_once_with("GET", f"{LIFETIME_TOTALS_URL}/tester")
+
+
+class TestCalendarDedup:
+    async def test_item_in_both_month_views_is_listed_once(self):
+        """A month view includes adjacent-month days, so both calls return it."""
+        client = GarminClient(_make_auth())
+        tomorrow = (client.today() + timedelta(days=1)).isoformat()
+        item = {
+            "id": 1810350286,
+            "itemType": "workout",
+            "title": "Run Workout",
+            "date": tomorrow,
+            "workoutId": 1731319876,
+        }
+        with (
+            patch.object(
+                client, "get_activities", new_callable=AsyncMock, return_value=[]
+            ),
+            patch.object(
+                client, "get_workouts", new_callable=AsyncMock, return_value=[]
+            ),
+            patch.object(
+                client,
+                "get_scheduled_workouts",
+                new_callable=AsyncMock,
+                return_value={"calendarItems": [item]},
+            ),
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
+        ):
+            data = await client.fetch_activity_data()
+
+        assert [w["id"] for w in data["scheduledWorkouts"]] == [1810350286]
+
+
+class TestSlowCache:
+    async def test_result_is_reused_within_the_hour(self):
+        client = GarminClient(_make_auth())
+        fetch = AsyncMock(return_value={"totalSteps": 1})
+        assert await client._cached_safe_call("k", fetch) == {"totalSteps": 1}
+        assert await client._cached_safe_call("k", fetch) == {"totalSteps": 1}
+        assert fetch.await_count == 1
+
+    async def test_refetched_after_the_hour(self):
+        client = GarminClient(_make_auth())
+        fetch = AsyncMock(return_value=[])
+        with patch(
+            "ha_garmin.client.time.monotonic", side_effect=[0.0, 3601.0, 3601.0]
+        ):
+            await client._cached_safe_call("k", fetch)
+            await client._cached_safe_call("k", fetch)
+        assert fetch.await_count == 2
+
+    async def test_failures_are_not_cached(self):
+        client = GarminClient(_make_auth())
+        fetch = AsyncMock(side_effect=[GarminAPIError("boom"), {"ok": True}])
+        assert await client._cached_safe_call("k", fetch) is None
+        assert await client._cached_safe_call("k", fetch) == {"ok": True}

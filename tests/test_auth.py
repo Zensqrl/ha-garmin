@@ -3,6 +3,7 @@
 import os
 import stat
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -435,6 +436,29 @@ class TestGarminAuth:
         result = auth.load_session(str(symlink_file))
         assert result is False
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks only")
+    async def test_save_session_allows_root_owned_symlinked_parent(self, tmp_path):
+        """A root-owned symlink (e.g. /home -> var/home) is not attacker-plantable."""
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        symlink_dir = tmp_path / "link"
+        symlink_dir.symlink_to(real_dir)
+        real_lstat = Path.lstat
+
+        def fake_lstat(self):
+            st = real_lstat(self)
+            if self == symlink_dir:
+                return os.stat_result((st.st_mode, *st[1:4], 0, *st[5:]))
+            return st
+
+        auth = GarminAuth()
+        auth.di_token = "di_abc"
+        auth.di_refresh_token = "di_refresh"
+        auth.di_client_id = "CID"
+        with patch.object(Path, "lstat", fake_lstat):
+            auth.save_session(str(symlink_dir / "tokens.json"))
+        assert (real_dir / "tokens.json").exists()
+
     async def test_refresh_session_holds_token_lock(self):
         """refresh_session must execute the refresh while holding the token lock."""
         auth = GarminAuth()
@@ -567,7 +591,7 @@ class TestSecurityAuditHardening:
             patch.object(auth, "_widget_web_login", side_effect=boom),
             patch.object(auth, "_portal_web_login_cffi", side_effect=boom),
             patch.object(auth, "_portal_web_login_requests", side_effect=boom),
-            caplog.at_level("WARNING", logger="ha_garmin.auth"),
+            caplog.at_level("DEBUG", logger="ha_garmin.auth"),
             pytest.raises(GarminAPIError, match="exhausted") as exc_info,
         ):
             auth.login("u@x.com", "pw")
@@ -575,6 +599,23 @@ class TestSecurityAuditHardening:
         assert "ST-CANARY-123" not in caplog.text
         assert "ST-CANARY-123" not in str(exc_info.value)
         assert "ticket=<redacted>" in caplog.text
+
+    def test_failed_strategies_log_at_debug_and_summarize(self, caplog):
+        """A strategy failing is expected; only the final error reports them."""
+        auth = GarminAuth()
+        boom = ConnectionError("down")
+        with (
+            patch.object(auth, "_mobile_login_cffi", side_effect=boom),
+            patch.object(auth, "_mobile_login_requests", side_effect=boom),
+            patch.object(auth, "_widget_web_login", side_effect=boom),
+            patch.object(auth, "_portal_web_login_cffi", side_effect=boom),
+            patch.object(auth, "_portal_web_login_requests", side_effect=boom),
+            caplog.at_level("WARNING", logger="ha_garmin.auth"),
+            pytest.raises(GarminAPIError, match="ConnectionError; ") as exc_info,
+        ):
+            auth.login("u@x.com", "pw")
+        assert caplog.text == ""
+        assert "mobile+cffi: ConnectionError" in str(exc_info.value)
 
     def test_sanitize_exception_text_redacts_query_values(self):
         from ha_garmin.auth import _sanitize_exception_text

@@ -40,9 +40,11 @@ HYDRATION_LOG_URL = (
     f"{GARMIN_CONNECT_API}/usersummary-service/usersummary/hydration/log"
 )
 DAILY_STEPS_URL = f"{GARMIN_CONNECT_API}/usersummary-service/stats/steps/daily"
+LIFETIME_TOTALS_URL = (
+    f"{GARMIN_CONNECT_API}/usersummary-service/stats/connectLifetimeTotals"
+)
 
 # Body composition endpoints
-BODY_COMPOSITION_URL = f"{GARMIN_CONNECT_API}/weight-service/weight/range"
 WEIGHT_LATEST_URL = f"{GARMIN_CONNECT_API}/weight-service/weight/latest"
 
 # Fitness/Training endpoints
@@ -81,9 +83,7 @@ GOALS_URL = f"{GARMIN_CONNECT_API}/goal-service/goal/goals"
 BADGES_URL = f"{GARMIN_CONNECT_API}/badge-service/badge/earned"
 
 # Gear endpoints
-GEAR_URL = f"{GARMIN_CONNECT_API}/gear-service/gear/filterGear"
 GEAR_BASE_URL = f"{GARMIN_CONNECT_API}/gear-service/gear"
-GEAR_STATS_URL = f"{GARMIN_CONNECT_API}/gear-service/gear/stats"
 GEAR_DEFAULTS_URL = f"{GARMIN_CONNECT_API}/gear-service/gear/user"
 
 # Health endpoints
