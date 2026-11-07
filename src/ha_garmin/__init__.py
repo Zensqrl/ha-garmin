@@ -20,4 +20,4 @@ __all__ = [
     "GarminTLSError",
 ]
 
-__version__ = "0.1.52+zs1"
+__version__ = "0.1.57+zs1"

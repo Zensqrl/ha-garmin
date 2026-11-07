@@ -12,7 +12,7 @@ import ssl
 import time
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from datetime import timezone as fixed_timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,6 +30,7 @@ from .const import (
     BODY_COMPOSITION_URL,
     CALENDAR_EVENTS_URL,
     CALENDAR_URL,
+    DAILY_HEART_RATE_URL,
     DAILY_STEPS_URL,
     DAILY_STRESS_URL,
     DAILY_SUMMARY_CHART_URL,
@@ -607,6 +608,131 @@ def _trim_calendar_workout_item(item: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k in CALENDAR_WORKOUT_ESSENTIAL_KEYS}
 
 
+def _key(value: Any, key: str) -> Any:
+    """Return value[key] for Garmin's {"<thing>Key": ...} wrappers, else None."""
+    return value.get(key) if isinstance(value, dict) else None
+
+
+def _round_value(value: Any) -> Any:
+    """Round float noise (4828.02000001) off step values; leave others as is."""
+    return round(value, 2) if isinstance(value, float) else value
+
+
+_STEP_TARGET_FIELDS = {
+    "targetType": ("targetValueOne", "targetValueTwo", "zoneNumber"),
+    "secondaryTargetType": (
+        "secondaryTargetValueOne",
+        "secondaryTargetValueTwo",
+        "secondaryZoneNumber",
+    ),
+}
+
+
+def _trim_workout_step(step: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one workout step; a repeat group keeps its steps nested.
+
+    Target values are as Garmin stores them: bpm for heart rate, watts for
+    power, m/s for pace/speed, or a zoneNumber instead of a range.
+    """
+    nested = step.get("workoutSteps")
+    if step.get("type") == "RepeatGroupDTO" or isinstance(nested, list):
+        trimmed: dict[str, Any] = {
+            "stepOrder": step.get("stepOrder"),
+            "stepType": "repeat",
+            "numberOfIterations": step.get("numberOfIterations"),
+            "steps": [
+                _trim_workout_step(s) for s in nested or [] if isinstance(s, dict)
+            ],
+        }
+    else:
+        trimmed = {
+            "stepOrder": step.get("stepOrder"),
+            "stepType": _key(step.get("stepType"), "stepTypeKey"),
+            "description": step.get("description"),
+            "endCondition": _key(step.get("endCondition"), "conditionTypeKey"),
+            "endConditionValue": _round_value(step.get("endConditionValue")),
+            "targetType": _key(step.get("targetType"), "workoutTargetTypeKey"),
+            "targetValueOne": _round_value(step.get("targetValueOne")),
+            "targetValueTwo": _round_value(step.get("targetValueTwo")),
+            "zoneNumber": step.get("zoneNumber"),
+            "secondaryTargetType": _key(
+                step.get("secondaryTargetType"), "workoutTargetTypeKey"
+            ),
+            "secondaryTargetValueOne": _round_value(
+                step.get("secondaryTargetValueOne")
+            ),
+            "secondaryTargetValueTwo": _round_value(
+                step.get("secondaryTargetValueTwo")
+            ),
+            "secondaryZoneNumber": step.get("secondaryZoneNumber"),
+        }
+        # Garmin stores 0.0 placeholders for values that mean nothing here.
+        for target, values in _STEP_TARGET_FIELDS.items():
+            if trimmed.get(target) in (None, "no.target"):
+                for key in values:
+                    trimmed.pop(key, None)
+        if trimmed.get("endCondition") == "lap.button":
+            trimmed.pop("endConditionValue", None)
+    return {k: v for k, v in trimmed.items() if v is not None}
+
+
+def _workout_detail_fields(workout: dict[str, Any]) -> dict[str, Any]:
+    """Steps and estimates of a workout-service workout, for a scheduled item.
+
+    Segments are flattened into one step list (multi-sport workouts carry
+    the segment's sport on each of its steps).
+    """
+    segments = [s for s in workout.get("workoutSegments") or [] if isinstance(s, dict)]
+    steps: list[dict[str, Any]] = []
+    for segment in segments:
+        sport = _key(segment.get("sportType"), "sportTypeKey")
+        for step in segment.get("workoutSteps") or []:
+            if isinstance(step, dict):
+                trimmed = _trim_workout_step(step)
+                if len(segments) > 1 and sport:
+                    trimmed["sportType"] = sport
+                steps.append(trimmed)
+    fields = {
+        "estimatedDistanceInMeters": _round_value(
+            workout.get("estimatedDistanceInMeters")
+        ),
+        "estimatedDurationInSecs": workout.get("estimatedDurationInSecs"),
+        "workoutProvider": workout.get("workoutProvider"),
+        "workoutSteps": steps,
+    }
+    return {k: v for k, v in fields.items() if v is not None}
+
+
+def _latest_heart_rate_sample(data: dict[str, Any]) -> dict[str, Any]:
+    """The newest sample in a dailyHeartRate response, or {} if it has none.
+
+    heartRateValues are [UTC epoch ms, bpm] pairs, about every 2 minutes up
+    to the last watch sync; bpm is None where the watch measured nothing.
+    """
+    for pair in reversed(data.get("heartRateValues") or []):
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        timestamp, bpm = pair
+        if (
+            isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)
+            and isinstance(bpm, int)
+            and not isinstance(bpm, bool)
+            and bpm > 0
+        ):
+            try:
+                if not math.isfinite(timestamp):
+                    continue
+                sample_time = datetime.fromtimestamp(timestamp / 1000, UTC)
+            except (OverflowError, OSError, ValueError):
+                continue
+            return {
+                "latestHeartRate": bpm,
+                "latestHeartRateTime": sample_time,
+            }
+    return {}
+
+
 def _trim_goal_event(event: dict[str, Any]) -> dict[str, Any]:
     """Trim a training plan's goal event to the fields that matter.
 
@@ -702,6 +828,34 @@ def _local_timestamp_ms_to_datetime(
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
 
 
+def _sleep_stress_series(raw: Any) -> list[dict[str, Any]]:
+    """Simplify the sleep response's stress samples to [{time, value}].
+
+    Garmin reports one sample per few minutes with an epoch-ms startGMT;
+    negative values mark samples it could not measure and are dropped.
+    """
+    if not isinstance(raw, list):
+        return []
+    series = []
+    for sample in raw:
+        if not isinstance(sample, dict):
+            continue
+        start = sample.get("startGMT")
+        value = sample.get("value")
+        if not isinstance(start, int | float) or not isinstance(value, int | float):
+            continue
+        if isinstance(start, bool) or isinstance(value, bool) or value < 0:
+            continue
+        try:
+            if not math.isfinite(start) or not math.isfinite(value):
+                continue
+            timestamp = datetime.fromtimestamp(start / 1000, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            continue
+        series.append({"time": timestamp, "value": value})
+    return series
+
+
 def _project_time_of_day_to_date(
     target_date: date | None,
     timestamp_ms: int | float | None,
@@ -775,17 +929,17 @@ def _extract_sleep_timezone_offset_minutes(
     return 0
 
 
-_TRAINING_STATUS_MAP: dict[int, str] = {
-    0: "No Status",
-    1: "Peaking (Legacy)",
-    2: "Unproductive",
-    3: "Detraining",
-    4: "Maintaining",
-    5: "Recovering",
-    6: "Peaking",
-    7: "Productive",
-    8: "Strained",
-}
+def _training_status_label(entry: dict[str, Any]) -> str | None:
+    """Return the training status label for one device's status entry.
+
+    Derived from trainingStatusFeedbackPhrase, which Garmin sends with the
+    numeric code: the trailing _<n> is stripped and the rest title-cased
+    (OVERREACHING_1 -> "Overreaching", NO_STATUS -> "No Status").
+    """
+    phrase = entry.get("trainingStatusFeedbackPhrase")
+    if not isinstance(phrase, str) or not phrase.strip():
+        return None
+    return re.sub(r"_\d+$", "", phrase.strip()).replace("_", " ").title()
 
 
 def _vo2max_sport_entry(most_recent_vo2: dict[str, Any]) -> dict[str, Any]:
@@ -915,12 +1069,7 @@ def _add_computed_fields(data: dict[str, Any]) -> dict[str, Any]:
                 device_entries,
                 key=lambda x: x.get("calendarDate") or "",
             )
-            status_code = most_recent.get("trainingStatus")
-            result["trainingStatusPhrase"] = (
-                _TRAINING_STATUS_MAP.get(status_code)
-                if isinstance(status_code, int)
-                else None
-            )
+            result["trainingStatusPhrase"] = _training_status_label(most_recent)
         else:
             result["trainingStatusPhrase"] = None
         most_recent_vo2 = training_status.get("mostRecentVO2Max")
@@ -1210,6 +1359,9 @@ class GarminClient:
         # Slow-changing data fetched at most once per _SLOW_CACHE_SECONDS:
         # key -> (monotonic fetch time, value).
         self._slow_cache: dict[str, tuple[float, Any]] = {}
+        # Latest heart rate sample and the watch sync it was fetched after.
+        self._latest_heart_rate: dict[str, Any] = {}
+        self._latest_heart_rate_sync: Any = None
         # Per-activity lookups that only need one API call per new activity.
         self._summary_fields_cache = _PerActivityCache(
             self._EBIKE_FIELDS_EMPTY_RETRY_LIMIT
@@ -1467,7 +1619,7 @@ class GarminClient:
             )
         return bytes(response.content)
 
-    async def _cached_safe_call(self, key: str, func: Any) -> Any:
+    async def _cached_safe_call(self, key: str, func: Any, *args: Any) -> Any:
         """_safe_call, reusing a successful result for _SLOW_CACHE_SECONDS.
 
         For data that barely changes (lifetime totals, upcoming events), so
@@ -1477,7 +1629,7 @@ class GarminClient:
         cached = self._slow_cache.get(key)
         if cached and time.monotonic() - cached[0] < _SLOW_CACHE_SECONDS:
             return cached[1]
-        value = await self._safe_call(func)
+        value = await self._safe_call(func, *args)
         if value is not None:
             self._slow_cache[key] = (time.monotonic(), value)
         return value
@@ -1850,6 +2002,12 @@ class GarminClient:
             return data.get("workouts", [])
         return data if isinstance(data, list) else []
 
+    async def get_workout(self, workout_id: int) -> dict[str, Any]:
+        """Get one workout's full definition: segments, steps and targets."""
+        workout_id = _validate_positive_int(workout_id, "workout_id")
+        data = await self._request("GET", f"{WORKOUT_URL}/{workout_id}")
+        return data if isinstance(data, dict) else {}
+
     async def get_scheduled_workouts(self, year: int, month: int) -> dict[str, Any]:
         """Get the training calendar for a given year and month (1-12).
 
@@ -2186,6 +2344,41 @@ class GarminClient:
             return {}
         self._learn_utc_offset(data)
         return data
+
+    async def get_daily_heart_rate(self, target_date: date) -> dict[str, Any]:
+        """Get a day's heart rate: resting/min/max and the sampled values."""
+        profile = await self.get_user_profile()
+        url = f"{DAILY_HEART_RATE_URL}/{quote(profile.display_name, safe='')}"
+        params = {"date": target_date.isoformat()}
+        data = await self._request("GET", url, params=params)
+        return data if isinstance(data, dict) else {}
+
+    async def get_latest_heart_rate(self) -> dict[str, Any]:
+        """The newest heart rate sample and when it was measured (UTC).
+
+        Returns {"latestHeartRate": bpm, "latestHeartRateTime": datetime},
+        or {} without samples. Right after midnight today has none yet, so
+        yesterday's last sample is used. Samples only reach Garmin when the
+        watch syncs, so this is never live heart rate.
+        """
+        today = self.today()
+        for day in (today, today - timedelta(days=1)):
+            sample = _latest_heart_rate_sample(await self.get_daily_heart_rate(day))
+            if sample:
+                return sample
+        return {}
+
+    async def get_daily_summary(self, target_date: date) -> dict[str, Any]:
+        """Get Garmin's daily summary for any date, as Garmin returns it.
+
+        Steps, distance, calories, heart rate, stress, Body Battery,
+        intensity minutes, respiration and floors for that day; one API call.
+        For a past day this is the final summary, including data the watch
+        synced after midnight.
+        """
+        if not isinstance(target_date, date):
+            raise ValueError(f"target_date must be a date, got {target_date!r}")
+        return await self._get_user_summary_raw(target_date)
 
     async def _get_sleep_data_raw(
         self, target_date: date | None = None
@@ -3044,11 +3237,13 @@ class GarminClient:
         if not isinstance(workout, dict):
             raise ValueError("workout must be a JSON object")
         url = f"{WORKOUT_URL}/{workout_id}"
+        self._slow_cache.pop(f"workout_{workout_id}", None)
         return await self._put_request(url, workout | {"workoutId": workout_id})
 
     async def delete_workout(self, workout_id: int) -> dict[str, Any]:
         """Delete a workout from the library (also drops its schedules)."""
         workout_id = _validate_positive_int(workout_id, "workout_id")
+        self._slow_cache.pop(f"workout_{workout_id}", None)
         return await self._delete_request(f"{WORKOUT_URL}/{workout_id}")
 
     async def schedule_workout(
@@ -3080,11 +3275,19 @@ class GarminClient:
 
     # ========== Multi-Coordinator Fetch Methods ==========
 
-    async def fetch_core_data(self, target_date: date | None = None) -> dict[str, Any]:
+    async def fetch_core_data(
+        self, target_date: date | None = None, *, latest_heart_rate: bool = False
+    ) -> dict[str, Any]:
         """Fetch core data: summary, daily steps, sleep, intraday timelines.
 
+        With latest_heart_rate, also latestHeartRate and latestHeartRateTime
+        (see get_latest_heart_rate), re-fetched only after a new watch sync,
+        since samples can't change in between.
+
         API calls: get_user_summary, get_daily_steps, get_sleep_data,
-        get_daily_stress (4 calls)
+                   get_daily_stress (4 calls),
+                   plus get_latest_heart_rate (1-2) per new sync if asked
+
         """
         if target_date is None:
             target_date = self.today()
@@ -3164,6 +3367,16 @@ class GarminClient:
         avg_sleep_respiration_value = None
         skin_temp_deviation = None
         skin_temp_calibration_days = None
+        avg_sleep_stress = None
+        awake_count = None
+        restless_moments_count = None
+        avg_sleep_heart_rate = None
+        sleep_body_battery_change = None
+        sleep_stress = None
+        sleep_scores = None
+        sleep_score_feedback = None
+        sleep_score_insight = None
+        sleep_score_personalized_insight = None
 
         if sleep_data:
             # Skin temperature sits at the root of the sleep response, not in
@@ -3173,12 +3386,29 @@ class GarminClient:
             if sleep_data.get("skinTempDataExists"):
                 skin_temp_deviation = sleep_data.get("avgSkinTempDeviationC")
                 skin_temp_calibration_days = sleep_data.get("skinTempCalibrationDays")
+            # Restless moments and the overnight body battery change also sit
+            # at the root of the response, next to their time series.
+            restless_moments_count = sleep_data.get("restlessMomentsCount")
+            sleep_body_battery_change = sleep_data.get("bodyBatteryChange")
+            sleep_stress = _sleep_stress_series(sleep_data.get("sleepStress"))
             try:
                 daily_sleep = sleep_data.get("dailySleepDTO") or {}
                 sleep_alignment = daily_sleep.get("sleepAlignment") or {}
-                sleep_score = (
-                    (daily_sleep.get("sleepScores") or {}).get("overall") or {}
-                ).get("value")
+                # Per-component qualifiers (EXCELLENT/GOOD/FAIR/POOR) with
+                # their optimal ranges: the score breakdown Garmin shows
+                # under the sleep score. Passed through as-is for attributes.
+                sleep_scores = daily_sleep.get("sleepScores") or None
+                sleep_score = ((sleep_scores or {}).get("overall") or {}).get("value")
+                sleep_score_feedback = daily_sleep.get("sleepScoreFeedback")
+                sleep_score_insight = daily_sleep.get("sleepScoreInsight")
+                sleep_score_personalized_insight = daily_sleep.get(
+                    "sleepScorePersonalizedInsight"
+                )
+                # Stress, heart rate and awakenings averaged/counted over the
+                # sleep window only; the summary endpoint has day-wide values.
+                avg_sleep_stress = daily_sleep.get("avgSleepStress")
+                avg_sleep_heart_rate = daily_sleep.get("avgHeartRate")
+                awake_count = daily_sleep.get("awakeCount")
                 sleep_time_seconds = daily_sleep.get("sleepTimeSeconds")
                 deep_sleep_seconds = daily_sleep.get("deepSleepSeconds")
                 light_sleep_seconds = daily_sleep.get("lightSleepSeconds")
@@ -3280,7 +3510,23 @@ class GarminClient:
             "avgSleepRespirationValue": avg_sleep_respiration_value,
             "avgSkinTempDeviationC": skin_temp_deviation,
             "skinTempCalibrationDays": skin_temp_calibration_days,
+            "avgSleepStress": avg_sleep_stress,
+            "awakeCount": awake_count,
+            "restlessMomentsCount": restless_moments_count,
+            "avgSleepHeartRate": avg_sleep_heart_rate,
+            "sleepBodyBatteryChange": sleep_body_battery_change,
+            "sleepStress": sleep_stress,
+            "sleepScores": sleep_scores,
+            "sleepScoreFeedback": sleep_score_feedback,
+            "sleepScoreInsight": sleep_score_insight,
+            "sleepScorePersonalizedInsight": sleep_score_personalized_insight,
         }
+        if latest_heart_rate:
+            data.update(
+                await self._latest_heart_rate_since_sync(
+                    summary_raw.get("lastSyncTimestampGMT")
+                )
+            )
         data["_sources"] = {
             k: v for k, v in provenance.sources.items() if not k.endswith("Fallback")
         }
@@ -3290,6 +3536,18 @@ class GarminClient:
         if isinstance(last_sync, datetime):
             result["_sources"]["summary"]["last_sync_at"] = last_sync.isoformat()
         return result
+
+    async def _latest_heart_rate_since_sync(self, last_sync: Any) -> dict[str, Any]:
+        """Latest heart rate, fetched again only when the watch has synced.
+
+        A failed fetch leaves the cache as it was, so the next poll retries.
+        """
+        if last_sync is None or last_sync != self._latest_heart_rate_sync:
+            sample = await self._safe_call(self.get_latest_heart_rate)
+            if sample is not None:
+                self._latest_heart_rate = sample
+                self._latest_heart_rate_sync = last_sync
+        return self._latest_heart_rate
 
     # How many recent activities to pull for `lastActivities`. Consumers (e.g.
     # the Home Assistant integration) derive a rolling-week count from this
@@ -3308,7 +3566,9 @@ class GarminClient:
         API calls: get_activities, get_activity_details,
                    get_activity_hr_in_timezones, get_workouts,
                    get_scheduled_workouts x2 (this + next month) (6 calls),
-                   get_upcoming_events at most once an hour, get_activity once per
+                   get_upcoming_events at most once an hour, get_workout for
+                   today's and the next scheduled workout at most once an hour
+                   each, get_activity once per
                    new activity (e-bike fields, Connect IQ measurements) and
                    get_activity_connect_iq_display_info when it has any
 
@@ -3422,6 +3682,23 @@ class GarminClient:
             (w for w in scheduled_workouts if w.get("date") == today_str), {}
         )
         next_workout = scheduled_workouts[0] if scheduled_workouts else {}
+        # Steps and targets for today's and the next session only, on copies
+        # so scheduledWorkouts stays light. Adaptive/Coach items carry no
+        # workoutId and are left as they are.
+        today_workout, next_workout = dict(today_workout), dict(next_workout)
+        for workout in (today_workout, next_workout):
+            workout_id = workout.get("workoutId")
+            if (
+                isinstance(workout_id, bool)
+                or not isinstance(workout_id, int)
+                or workout_id <= 0
+            ):
+                continue
+            detail = await self._cached_safe_call(
+                f"workout_{workout_id}", self.get_workout, workout_id
+            )
+            if detail:
+                workout.update(_workout_detail_fields(detail))
 
         # Goal event: the plan's own target race, else the primary event,
         # else the soonest race. atpPlanId (not the item's own trainingPlanId,
@@ -3619,11 +3896,16 @@ class GarminClient:
         }
         return _add_computed_fields(data)
 
-    async def fetch_goals_data(self) -> dict[str, Any]:
+    async def fetch_goals_data(self, *, lifetime_totals: bool = True) -> dict[str, Any]:
         """Fetch goals data: goals, badges, lifetime totals.
 
+        lifetimeTotalsHidden is True when Garmin refused the lifetime totals
+        because they aren't shown in the user's profile (see
+        _lifetime_totals); lifetimeTotals is then empty.
+
         API calls: get_goals×3, get_earned_badges (4 calls), plus
-                   get_lifetime_totals at most once an hour
+                   get_lifetime_totals at most once an hour unless
+                   lifetime_totals is False
         """
         active_goals = await self._safe_call(self.get_goals, "active")
         future_goals = await self._safe_call(self.get_goals, "future")
@@ -3677,11 +3959,35 @@ class GarminClient:
             "badges": badges,
             "userPoints": user_points,
             "userLevel": user_level,
-            "lifetimeTotals": await self._cached_safe_call(
-                "lifetime_totals", self.get_lifetime_totals
-            )
-            or {},
+            **(
+                await self._lifetime_totals()
+                if lifetime_totals
+                else {"lifetimeTotals": {}, "lifetimeTotalsHidden": False}
+            ),
         }
+
+    async def _lifetime_totals(self) -> dict[str, Any]:
+        """Lifetime totals, and whether Garmin hides them.
+
+        Garmin answers 403 unless "Lifetime Totals" is shown in the user's
+        profile (Account Settings > Public Profile > Show in profile; the
+        profile can stay private); that is reported as lifetimeTotalsHidden.
+        Only real totals are cached (hourly): a hidden or failed answer is
+        asked again on the next poll, so changing the setting shows at once.
+        """
+        cached = self._slow_cache.get("lifetime_totals")
+        if cached and time.monotonic() - cached[0] < _SLOW_CACHE_SECONDS:
+            return cast(dict[str, Any], cached[1])
+        try:
+            totals = await self.get_lifetime_totals()
+        except GarminAPIError as err:
+            if err.status_code == 403:
+                return {"lifetimeTotals": {}, "lifetimeTotalsHidden": True}
+            _LOGGER.warning("API call get_lifetime_totals failed: %s", err)
+            return {"lifetimeTotals": {}, "lifetimeTotalsHidden": False}
+        result = {"lifetimeTotals": totals, "lifetimeTotalsHidden": False}
+        self._slow_cache["lifetime_totals"] = (time.monotonic(), result)
+        return result
 
     async def fetch_gear_data(self, timezone: str | None = None) -> dict[str, Any]:
         """Fetch gear data: gear, defaults, stats, alarms, solar, devices, sensors.

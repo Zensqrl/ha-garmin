@@ -366,6 +366,9 @@ class TestGarminClient:
             patch.object(
                 client, "get_upcoming_events", new_callable=AsyncMock
             ) as mock_goal,
+            patch.object(
+                client, "get_workout", new_callable=AsyncMock, return_value={}
+            ),
         ):
             mock_acts.return_value = []
             mock_workouts.return_value = []
@@ -1425,9 +1428,30 @@ class TestGarminClient:
                     "optimalSleepWindowStartMins": 10,
                     "optimalSleepWindowEndMins": 20,
                 },
-                "sleepScores": {"overall": {"value": 85}},
+                "sleepScores": {
+                    "overall": {"value": 85, "qualifierKey": "GOOD"},
+                    "stress": {
+                        "qualifierKey": "FAIR",
+                        "optimalStart": 0.0,
+                        "optimalEnd": 15.0,
+                    },
+                },
+                "sleepScoreFeedback": "POSITIVE_LONG_AND_DEEP",
+                "sleepScoreInsight": "NONE",
+                "sleepScorePersonalizedInsight": "RHYTHM_POS_GOOD_SLEEP",
                 "averageRespirationValue": 14.2,
+                "avgSleepStress": 21.0,
+                "avgHeartRate": 58.0,
+                "awakeCount": 2,
             },
+            "restlessMomentsCount": 50,
+            "bodyBatteryChange": 48,
+            "sleepStress": [
+                {"startGMT": 1775944800000, "value": 18.0},
+                {"startGMT": 1775944980000, "value": -1.0},
+                {"startGMT": 1775945160000, "value": 22.0},
+                {"startGMT": None, "value": 5.0},
+            ],
             "skinTempDataExists": True,
             "avgSkinTempDeviationC": 0.2,
             "avgSkinTempDeviationF": 0.3,
@@ -1471,6 +1495,25 @@ class TestGarminClient:
         assert data["avgSleepRespirationValue"] == 14.2
         assert data["avgSkinTempDeviationC"] == 0.2
         assert data["skinTempCalibrationDays"] == 19
+        assert data["avgSleepStress"] == 21.0
+        assert data["avgSleepHeartRate"] == 58.0
+        assert data["awakeCount"] == 2
+        assert data["restlessMomentsCount"] == 50
+        assert data["sleepBodyBatteryChange"] == 48
+        # Unmeasured (negative) and malformed samples are dropped.
+        assert data["sleepStress"] == [
+            {"time": datetime(2026, 4, 11, 22, 0, tzinfo=UTC), "value": 18.0},
+            {"time": datetime(2026, 4, 11, 22, 6, tzinfo=UTC), "value": 22.0},
+        ]
+        assert data["sleepScores"]["overall"]["qualifierKey"] == "GOOD"
+        assert data["sleepScores"]["stress"] == {
+            "qualifierKey": "FAIR",
+            "optimalStart": 0.0,
+            "optimalEnd": 15.0,
+        }
+        assert data["sleepScoreFeedback"] == "POSITIVE_LONG_AND_DEEP"
+        assert data["sleepScoreInsight"] == "NONE"
+        assert data["sleepScorePersonalizedInsight"] == "RHYTHM_POS_GOOD_SLEEP"
 
     async def test_fetch_core_data_bedtime_uses_gmt_local_delta_for_offset(self):
         """bedtime/wake_time must not silently assume UTC+0.
@@ -1534,6 +1577,15 @@ class TestGarminClient:
         # No skin temperature sensor data in this payload.
         assert data["avgSkinTempDeviationC"] is None
         assert data["skinTempCalibrationDays"] is None
+        # Sleep-only fields absent from the payload stay None.
+        assert data["avgSleepStress"] is None
+        assert data["awakeCount"] is None
+        assert data["restlessMomentsCount"] is None
+        assert data["avgSleepHeartRate"] is None
+        assert data["sleepBodyBatteryChange"] is None
+        assert data["sleepStress"] == []
+        assert data["sleepScores"] == {"overall": {"value": 84}}
+        assert data["sleepScoreFeedback"] is None
 
     async def test_fetch_core_data_transient_error_does_not_use_yesterday(self):
         """Test a transient 502/503 does not get papered over with yesterday's summary.
@@ -3636,6 +3688,9 @@ class TestCalendarDedup:
             patch.object(
                 client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
             ),
+            patch.object(
+                client, "get_workout", new_callable=AsyncMock, return_value={}
+            ),
         ):
             data = await client.fetch_activity_data()
 
@@ -3665,3 +3720,419 @@ class TestSlowCache:
         fetch = AsyncMock(side_effect=[GarminAPIError("boom"), {"ok": True}])
         assert await client._cached_safe_call("k", fetch) is None
         assert await client._cached_safe_call("k", fetch) == {"ok": True}
+
+
+class TestScheduledWorkoutSteps:
+    """Today's and the next scheduled workout carry their steps and targets."""
+
+    # Shape from a Final Surge workout synced to Garmin, plus a
+    # repeat group as Garmin stores intervals.
+    _WORKOUT = {
+        "workoutId": 1731319876,
+        "workoutName": "Easy 3 miles",
+        "estimatedDistanceInMeters": 4828.02,
+        "estimatedDurationInSecs": None,
+        "workoutProvider": "FinalSurge",
+        "workoutSegments": [
+            {
+                "segmentOrder": 1,
+                "sportType": {"sportTypeKey": "running"},
+                "workoutSteps": [
+                    {
+                        "type": "ExecutableStepDTO",
+                        "stepOrder": 1,
+                        "stepType": {"stepTypeKey": "interval"},
+                        "endCondition": {"conditionTypeKey": "distance"},
+                        "endConditionValue": 4828.02000001,
+                        "targetType": {"workoutTargetTypeKey": "heart.rate.zone"},
+                        "targetValueOne": 141.0,
+                        "targetValueTwo": 159.0,
+                        "zoneNumber": None,
+                        "description": None,
+                    },
+                    {
+                        "type": "RepeatGroupDTO",
+                        "stepOrder": 2,
+                        "numberOfIterations": 4,
+                        "workoutSteps": [
+                            {
+                                "type": "ExecutableStepDTO",
+                                "stepOrder": 3,
+                                "stepType": {"stepTypeKey": "interval"},
+                                "endCondition": {"conditionTypeKey": "time"},
+                                "endConditionValue": 60.0,
+                                "targetType": {"workoutTargetTypeKey": "pace.zone"},
+                                "targetValueOne": 3.7037037,
+                                "targetValueTwo": 3.3333333,
+                            },
+                            {
+                                "type": "ExecutableStepDTO",
+                                "stepOrder": 4,
+                                "stepType": {"stepTypeKey": "recovery"},
+                                "endCondition": {"conditionTypeKey": "lap.button"},
+                                "targetType": {"workoutTargetTypeKey": "no.target"},
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+    def test_placeholder_values_are_dropped(self):
+        """Garmin's 0.0 for an untargeted or lap-button step means nothing."""
+        from ha_garmin.client import _trim_workout_step
+
+        step = {
+            "stepOrder": 1,
+            "stepType": {"stepTypeKey": "warmup"},
+            "endCondition": {"conditionTypeKey": "lap.button"},
+            "endConditionValue": 0.0,
+            "targetType": {"workoutTargetTypeKey": "no.target"},
+            "targetValueTwo": 0.0,
+        }
+        assert _trim_workout_step(step) == {
+            "stepOrder": 1,
+            "stepType": "warmup",
+            "endCondition": "lap.button",
+            "targetType": "no.target",
+        }
+
+    def test_detail_fields_flatten_steps_and_keep_repeats_nested(self):
+        from ha_garmin.client import _workout_detail_fields
+
+        assert _workout_detail_fields(self._WORKOUT) == {
+            "estimatedDistanceInMeters": 4828.02,
+            "workoutProvider": "FinalSurge",
+            "workoutSteps": [
+                {
+                    "stepOrder": 1,
+                    "stepType": "interval",
+                    "endCondition": "distance",
+                    "endConditionValue": 4828.02,
+                    "targetType": "heart.rate.zone",
+                    "targetValueOne": 141.0,
+                    "targetValueTwo": 159.0,
+                },
+                {
+                    "stepOrder": 2,
+                    "stepType": "repeat",
+                    "numberOfIterations": 4,
+                    "steps": [
+                        {
+                            "stepOrder": 3,
+                            "stepType": "interval",
+                            "endCondition": "time",
+                            "endConditionValue": 60.0,
+                            "targetType": "pace.zone",
+                            "targetValueOne": 3.7,
+                            "targetValueTwo": 3.33,
+                        },
+                        {
+                            "stepOrder": 4,
+                            "stepType": "recovery",
+                            "endCondition": "lap.button",
+                            "targetType": "no.target",
+                        },
+                    ],
+                },
+            ],
+        }
+
+    def test_multisport_steps_carry_their_sport(self):
+        from ha_garmin.client import _workout_detail_fields
+
+        step = {"stepOrder": 1, "stepType": {"stepTypeKey": "interval"}}
+        workout = {
+            "workoutSegments": [
+                {"sportType": {"sportTypeKey": "swimming"}, "workoutSteps": [step]},
+                {"sportType": {"sportTypeKey": "cycling"}, "workoutSteps": [step]},
+            ]
+        }
+        steps = _workout_detail_fields(workout)["workoutSteps"]
+        assert [s["sportType"] for s in steps] == ["swimming", "cycling"]
+
+    async def _fetch(self, client, items, workout):
+        get_workout = AsyncMock(return_value=workout)
+        with (
+            patch.object(
+                client, "get_activities", new_callable=AsyncMock, return_value=[]
+            ),
+            patch.object(
+                client, "get_workouts", new_callable=AsyncMock, return_value=[]
+            ),
+            patch.object(
+                client,
+                "get_scheduled_workouts",
+                new_callable=AsyncMock,
+                return_value={"calendarItems": items},
+            ),
+            patch.object(
+                client, "get_upcoming_events", new_callable=AsyncMock, return_value=[]
+            ),
+            patch.object(client, "get_workout", get_workout),
+        ):
+            data = await client.fetch_activity_data()
+        return data, get_workout
+
+    async def test_today_and_next_get_steps_once_per_hour(self):
+        client = GarminClient(_make_auth())
+        item = {
+            "id": 1810350286,
+            "itemType": "workout",
+            "title": "Easy 3 miles",
+            "date": client.today().isoformat(),
+            "workoutId": 1731319876,
+        }
+        data, get_workout = await self._fetch(client, [item], self._WORKOUT)
+
+        steps = data["todayScheduledWorkout"]["workoutSteps"]
+        assert steps[0]["targetValueOne"] == 141.0
+        assert data["nextScheduledWorkout"]["workoutSteps"] == steps
+        # The calendar list stays light.
+        assert "workoutSteps" not in data["scheduledWorkouts"][0]
+        # Today's and next are the same workout: one call, then cached.
+        get_workout.assert_awaited_once_with(1731319876)
+        _, get_workout = await self._fetch(client, [item], self._WORKOUT)
+        get_workout.assert_not_awaited()
+
+    async def test_adaptive_item_without_workout_id_is_left_alone(self):
+        client = GarminClient(_make_auth())
+        item = {
+            "id": 1789814567000,
+            "itemType": "fbtAdaptiveWorkout",
+            "title": "Basis",
+            "date": client.today().isoformat(),
+        }
+        data, get_workout = await self._fetch(client, [item], self._WORKOUT)
+        get_workout.assert_not_awaited()
+        assert "workoutSteps" not in data["todayScheduledWorkout"]
+
+    async def test_update_and_delete_drop_cached_detail(self):
+        client = GarminClient(_make_auth())
+        client._slow_cache["workout_5"] = (0.0, {})
+        with patch.object(client, "_put_request", new_callable=AsyncMock):
+            await client.update_workout(5, {})
+        assert "workout_5" not in client._slow_cache
+        client._slow_cache["workout_5"] = (0.0, {})
+        with patch.object(client, "_delete_request", new_callable=AsyncMock):
+            await client.delete_workout(5)
+        assert "workout_5" not in client._slow_cache
+
+
+class TestTrainingStatusLabel:
+    def test_phrase_wins_over_code_in_computed_fields(self):
+        from ha_garmin.client import _add_computed_fields
+
+        result = _add_computed_fields(
+            {
+                "trainingStatus": {
+                    "mostRecentTrainingStatus": {
+                        "latestTrainingStatusData": {
+                            "123": {
+                                "calendarDate": "2026-10-23",
+                                "trainingStatus": 3,
+                                "trainingStatusFeedbackPhrase": "OVERREACHING_1",
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        assert result["trainingStatusPhrase"] == "Overreaching"
+
+
+class TestGetDailySummary:
+    async def test_returns_summary_for_the_given_date(self):
+        client = GarminClient(_make_auth())
+        with patch.object(
+            client,
+            "_get_user_summary_raw",
+            new_callable=AsyncMock,
+            return_value={"calendarDate": "2026-10-29", "averageStressLevel": 45},
+        ) as raw:
+            result = await client.get_daily_summary(date(2026, 10, 29))
+        raw.assert_awaited_once_with(date(2026, 10, 29))
+        assert result["averageStressLevel"] == 45
+
+    async def test_rejects_a_non_date(self):
+        client = GarminClient(_make_auth())
+        with pytest.raises(ValueError, match="must be a date"):
+            await client.get_daily_summary("2026-10-29")
+
+
+class TestLatestHeartRate:
+    """The newest heart rate sample, fetched again only after a watch sync."""
+
+    # Shape from a live dailyHeartRate response (values shortened).
+    _DAY = {
+        "calendarDate": "2026-10-30",
+        "heartRateValueDescriptors": [
+            {"index": 0, "key": "timestamp"},
+            {"index": 1, "key": "heartrate"},
+        ],
+        "heartRateValues": [
+            [1793314800000, 62],
+            [1793339160000, 57],
+            [1793339280000, None],
+        ],
+    }
+
+    def test_newest_sample_with_a_value(self):
+        from ha_garmin.client import _latest_heart_rate_sample
+
+        assert _latest_heart_rate_sample(self._DAY) == {
+            "latestHeartRate": 57,
+            "latestHeartRateTime": datetime(2026, 10, 30, 5, 46, tzinfo=UTC),
+        }
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            None,
+            [],
+            [[1793339160000, None]],
+            [[1793339160000, 0]],
+            [["x", 57]],
+            [[1, True]],
+        ],
+    )
+    def test_no_usable_sample(self, values):
+        from ha_garmin.client import _latest_heart_rate_sample
+
+        assert _latest_heart_rate_sample({"heartRateValues": values}) == {}
+
+    async def test_falls_back_to_yesterday_after_midnight(self):
+        client = GarminClient(_make_auth())
+        today = client.today()
+        days = {today: {"heartRateValues": []}, today - timedelta(days=1): self._DAY}
+        with patch.object(
+            client, "get_daily_heart_rate", side_effect=lambda d: days[d]
+        ) as daily:
+            sample = await client.get_latest_heart_rate()
+        assert sample["latestHeartRate"] == 57
+        assert daily.call_count == 2
+
+    async def test_daily_heart_rate_request(self):
+        from ha_garmin.const import DAILY_HEART_RATE_URL
+
+        client = GarminClient(_make_auth())
+        client._profile_cache = _PROFILE
+        client._request = AsyncMock(return_value=self._DAY)
+        assert await client.get_daily_heart_rate(date(2026, 10, 30)) == self._DAY
+        client._request.assert_awaited_once_with(
+            "GET", f"{DAILY_HEART_RATE_URL}/tester", params={"date": "2026-10-30"}
+        )
+
+    async def test_cached_until_a_new_sync(self):
+        client = GarminClient(_make_auth())
+        sample = {
+            "latestHeartRate": 57,
+            "latestHeartRateTime": datetime(2026, 10, 30, tzinfo=UTC),
+        }
+        latest = AsyncMock(return_value=sample)
+        with patch.object(client, "get_latest_heart_rate", latest):
+            assert await client._latest_heart_rate_since_sync("s1") == sample
+            assert await client._latest_heart_rate_since_sync("s1") == sample
+            latest.assert_awaited_once()
+            await client._latest_heart_rate_since_sync("s2")
+        assert latest.await_count == 2
+
+    async def test_failed_fetch_is_retried_next_poll(self):
+        client = GarminClient(_make_auth())
+        latest = AsyncMock(side_effect=GarminAPIError("Request failed: 500", 500))
+        with patch.object(client, "get_latest_heart_rate", latest):
+            assert await client._latest_heart_rate_since_sync("s1") == {}
+            await client._latest_heart_rate_since_sync("s1")
+        assert latest.await_count == 2
+
+    async def test_core_data_only_includes_it_when_asked(self):
+        client = GarminClient(_make_auth())
+        sample = {
+            "latestHeartRate": 57,
+            "latestHeartRateTime": datetime(2026, 10, 30, tzinfo=UTC),
+        }
+        with (
+            patch.object(
+                client,
+                "_get_user_summary_raw",
+                new_callable=AsyncMock,
+                return_value={
+                    "dailyStepGoal": 1,
+                    "lastSyncTimestampGMT": "2026-10-30T05:49:00.0",
+                },
+            ),
+            patch.object(
+                client, "get_daily_steps", new_callable=AsyncMock, return_value=[]
+            ),
+            patch.object(
+                client, "_get_sleep_data_raw", new_callable=AsyncMock, return_value={}
+            ),
+            patch.object(
+                client,
+                "get_latest_heart_rate",
+                new_callable=AsyncMock,
+                return_value=sample,
+            ) as latest,
+        ):
+            # The fork also fetches intraday stress; keep this upstream test offline.
+            client.get_daily_stress = AsyncMock(return_value={})
+            assert "latestHeartRate" not in await client.fetch_core_data()
+            latest.assert_not_awaited()
+            data = await client.fetch_core_data(latest_heart_rate=True)
+        assert data["latestHeartRate"] == 57
+        assert data["latestHeartRateTime"] == sample["latestHeartRateTime"]
+
+
+class TestLifetimeTotals:
+    """Lifetime totals: optional, hourly, and a profile that hides them is reported."""
+
+    @staticmethod
+    def _goals_client(lifetime):
+        client = GarminClient(_make_auth())
+        for name in ("get_goals", "get_earned_badges"):
+            setattr(client, name, AsyncMock(return_value=[]))
+        client.get_lifetime_totals = lifetime
+        return client
+
+    async def test_skipped_when_not_wanted(self):
+        lifetime = AsyncMock(return_value={"totalSteps": 1})
+        client = self._goals_client(lifetime)
+        data = await client.fetch_goals_data(lifetime_totals=False)
+        assert data["lifetimeTotals"] == {}
+        assert data["lifetimeTotalsHidden"] is False
+        lifetime.assert_not_awaited()
+
+    async def test_fetched_once_an_hour(self):
+        lifetime = AsyncMock(return_value={"totalSteps": 1})
+        client = self._goals_client(lifetime)
+        for _ in range(2):
+            data = await client.fetch_goals_data()
+            assert data["lifetimeTotals"] == {"totalSteps": 1}
+            assert data["lifetimeTotalsHidden"] is False
+        lifetime.assert_awaited_once()
+
+    async def test_403_reports_hidden_and_is_asked_again_next_poll(self, caplog):
+        lifetime = AsyncMock(side_effect=GarminAPIError("Request failed: 403", 403))
+        client = self._goals_client(lifetime)
+        for _ in range(2):
+            data = await client.fetch_goals_data()
+            assert data["lifetimeTotals"] == {}
+            assert data["lifetimeTotalsHidden"] is True
+        assert lifetime.await_count == 2
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+        # Once the profile shows them, the next poll has the totals.
+        lifetime.side_effect = None
+        lifetime.return_value = {"totalSteps": 1}
+        data = await client.fetch_goals_data()
+        assert data["lifetimeTotalsHidden"] is False
+        assert data["lifetimeTotals"] == {"totalSteps": 1}
+
+    async def test_other_errors_are_retried_next_poll(self):
+        lifetime = AsyncMock(side_effect=GarminAPIError("Request failed: 500", 500))
+        client = self._goals_client(lifetime)
+        for _ in range(2):
+            data = await client.fetch_goals_data()
+            assert data["lifetimeTotalsHidden"] is False
+        assert lifetime.await_count == 2
